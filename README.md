@@ -1,78 +1,102 @@
-# ANAC Dataset Browser
+# ANAC Dataset Downloader
 
-A simple web application to browse and view ANAC datasets stored in JSON format.
+Un downloader avanzato per i dataset pubblicati dall'Autorità Nazionale Anticorruzione (ANAC) su dati.anticorruzione.it.
 
-## Features
+## Caratteristiche
 
-- Browse available datasets
-- View dataset details
-- View JSON file contents
-- Debug file existence
-- Simple and intuitive interface
+- Download automatico di dataset JSON e CSV
+- Supporto per la ripresa dei download interrotti
+- Monitoraggio in tempo reale del progresso con:
+  - Barra di progresso grafica
+  - Velocità di download
+  - Tempo rimanente stimato (ETA)
+  - Dimensione file
+- Gestione automatica degli errori con retry
+- Rate limiting per evitare sovraccarichi del server
+- Logging dettagliato delle operazioni
+- Interfaccia utente interattiva
 
-## Project Structure
+## Requisiti
 
+- Python 3.7+
+- Dipendenze Python:
+  - aiohttp
+  - beautifulsoup4
+  - rich
+
+## Installazione
+
+1. Clona il repository:
+```bash
+git clone https://github.com/tuouser/anacdownloader.git
+cd anacdownloader
 ```
-.
-├── backend/                 # Backend Flask application
-│   ├── api_server.py       # API endpoints
-│   └── models/             # Database models
-├── simple-frontend/        # Frontend files
-│   ├── app.js             # Frontend JavaScript
-│   ├── index.html         # Main HTML file
-│   └── styles.css         # CSS styles
-├── data/                  # JSON data files
-├── config.py              # Configuration settings
-├── logger.py              # Logging configuration
-├── run_simple.py          # Application entry point
-└── requirements.txt       # Python dependencies
-```
 
-## Setup
-
-1. Create a virtual environment:
+2. Crea un ambiente virtuale (opzionale ma consigliato):
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Linux/Mac
+.venv\Scripts\activate     # Windows
 ```
 
-2. Install dependencies:
+3. Installa le dipendenze:
 ```bash
-pip install -r requirements.txt
+pip install aiohttp beautifulsoup4 rich
 ```
 
-3. Run the application:
+## Utilizzo
+
+1. Avvia il programma:
 ```bash
-python run_simple.py
+python scraper.py
 ```
 
-4. Open your browser and navigate to:
-```
-http://localhost:8082
-```
+2. Scegli un'opzione dal menu:
+   - 1. Scarica file JSON
+   - 2. Scarica file CSV
+   - 3. Scarica entrambi
+   - 4. Riprendi download interrotti
+   - 5. Mostra statistiche
+   - 6. Scarica file specifico
+   - 7. Esci
 
-## Usage
+3. I file verranno scaricati nella cartella `downloads/` organizzati in sottocartelle per tipo:
+   - `downloads/json/` per i file JSON
+   - `downloads/csv/` per i file CSV
 
-1. Click "Test Connection" to verify database connectivity
-2. Click "Load Datasets" to view available datasets
-3. Click on a dataset to view its details and files
-4. Click on a file to view its contents
-5. Use "Debug Files" to check file existence
+## Funzionalità Avanzate
 
-## Data Organization
+### Monitoraggio Download
+- Barra di progresso in tempo reale
+- Velocità di download in KB/s
+- Tempo rimanente stimato
+- Dimensione file in formato leggibile
 
-JSON files are organized in the `data/` directory, with each dataset having its own subdirectory:
+### Gestione Errori
+- Retry automatico in caso di errori
+- Backoff esponenziale tra i tentativi
+- Logging dettagliato degli errori
+- Possibilità di riprendere i download interrotti
 
-```
-data/
-├── dataset1/
-│   ├── file1.json
-│   └── file2.json
-└── dataset2/
-    ├── file3.json
-    └── file4.json
-```
+### Rate Limiting
+- Limite di richieste configurabile
+- Gestione automatica dei cookie
+- Simulazione comportamento browser
+- Timeout configurabili
 
-## License
+## File di Log
 
-This project is licensed under the MIT License. 
+- `anac_downloader.log`: Log principale delle operazioni
+- `download_problems.log`: Log specifico dei problemi riscontrati
+- `download_state.json`: Stato dei download per la ripresa
+
+## Note
+
+- Il programma utilizza tecniche di rate limiting per evitare di sovraccaricare il server
+- I download interrotti possono essere ripresi in qualsiasi momento
+- La velocità di download è limitata di default per evitare problemi
+- Tutti i file scaricati vengono verificati per integrità
+
+## Licenza
+
+Questo progetto è rilasciato sotto licenza MIT. Vedi il file LICENSE per i dettagli. 
