@@ -1,11 +1,11 @@
-import aiohttp
-import logging
 import os
+import logging
 import hashlib
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple
 import re
 import asyncio
+import aiohttp
 from pathlib import Path
 import json
 from datetime import datetime
@@ -20,6 +20,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.logging import RichHandler
 from rich.table import Table
 from rich.panel import Panel
+import zipfile
+import collections
+from rich.live import Live
 
 class RateLimiter:
     def __init__(self, calls_per_second=1):
@@ -238,7 +241,76 @@ class ANACScraper:
         
         self.USE_EXTERNAL = True  # Flag to use external tools
         self._check_external_tools()
+    
+    async def __aenter__(self):
+        """Support for async context manager protocol."""
+        # Inizializzazione della sessione
+        if self.session is None:
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=self.timeout)
+        return self
         
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup when exiting the async context manager."""
+        # Pulizia delle risorse
+        if hasattr(self, 'session') and self.session is not None:
+            await self.session.close()
+            self.session = None
+        return False  # Non sopprimere le eccezioni
+        
+    async def _make_request(self, relative_url: str) -> str:
+        """Effettua una richiesta HTTP GET e restituisce il contenuto HTML.
+        
+        Args:
+            relative_url: URL relativo (senza il dominio base).
+            
+        Returns:
+            Il contenuto HTML della risposta.
+        """
+        # Correggi URL relativi vs assoluti
+        if relative_url.startswith('http'):
+            # È già un URL completo
+            url = relative_url
+        else:
+            # Assicurati che l'URL relativo inizi con /
+            if not relative_url.startswith('/'):
+                relative_url = f"/{relative_url}"
+            url = f"{self.base_url}{relative_url}"
+            
+        self.logger.logger.debug(f"Richiesta HTTP a: {url}")
+        
+        # Assicuriamo che la sessione esista
+        if self.session is None:
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=self.timeout)
+        
+        # Applicazione del rate limiting
+        await self.rate_limiter.acquire()
+        
+        max_retries = 5
+        retry_count = 0
+        backoff_time = 2
+        
+        while retry_count < max_retries:
+            try:
+                async with self.session.get(url, timeout=self.timeout) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    elif response.status == 429:  # Too Many Requests
+                        retry_count += 1
+                        wait_time = backoff_time * (2 ** retry_count) + random.uniform(0, 1)
+                        self.logger.logger.warning(f"Rate limite raggiunto, attendo {wait_time:.2f}s prima di riprovare...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        self.logger.logger.error(f"Errore nella richiesta HTTP: {response.status} - {url}")
+                        return ""
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                retry_count += 1
+                wait_time = backoff_time * (2 ** retry_count) + random.uniform(0, 1)
+                self.logger.logger.error(f"Errore di connessione: {str(e)}. Tentativo {retry_count}/{max_retries}, attendo {wait_time:.2f}s...")
+                await asyncio.sleep(wait_time)
+        
+        self.logger.logger.error(f"Tutti i tentativi falliti per {url}")
+        return ""
+    
     def _check_external_tools(self):
         """Check if curl or wget are available on the system."""
         self.curl_available = False
@@ -274,7 +346,7 @@ class ANACScraper:
             if self.wget_available:
                 tools.append("wget")
             print(f"Utilizzo {', '.join(tools)} per i download.")
-        
+    
     def _get_downloader(self):
         """Determina quale downloader usare (curl o wget)."""
         if platform.system() == "Windows":
@@ -377,7 +449,7 @@ class ANACScraper:
     async def _fast_download(self, url: str, output_file: str, file_size: int) -> bool:
         """Tenta un download veloce senza limitazioni di velocità."""
         try:
-            self.logger.info(f"Tentativo download veloce per {os.path.basename(output_file)} ({self._format_size(file_size)})")
+            self.logger.logger.info(f"Tentativo download veloce per {os.path.basename(output_file)} ({self._format_size(file_size)})")
             
             # Creazione directory se non esiste
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -411,17 +483,17 @@ class ANACScraper:
             if process.returncode == 0 and os.path.exists(output_file):
                 actual_size = os.path.getsize(output_file)
                 if actual_size >= file_size * 0.99:  # Permette una differenza dell'1%
-                    self.logger.info(f"Download veloce completato: {os.path.basename(output_file)}")
+                    self.logger.logger.info(f"Download veloce completato: {os.path.basename(output_file)}")
                     return True
                 else:
-                    self.logger.warning(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
+                    self.logger.logger.warning(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
             else:
                 error_msg = stderr.decode() if stderr else "Errore sconosciuto"
-                self.logger.warning(f"Download veloce fallito: {error_msg}")
+                self.logger.logger.warning(f"Download veloce fallito: {error_msg}")
             
             return False
         except Exception as e:
-            self.logger.warning(f"Errore nel download veloce: {str(e)}")
+            self.logger.logger.warning(f"Errore nel download veloce: {str(e)}")
             return False
 
     def _format_size(self, size_bytes):
@@ -1316,164 +1388,250 @@ class ANACScraper:
             
     async def download_file(self, url: str, output_file: str, file_size: int) -> bool:
         """Scarica un file da un URL e lo salva nel percorso specificato."""
-        filename = os.path.basename(output_file)
-        start_time = time.time()
-        
-        # Crea la directory di output se non esiste
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        
-        # Controlla se il file esiste già e ha la dimensione corretta
-        if os.path.exists(output_file):
-            existing_size = os.path.getsize(output_file)
-            if existing_size == file_size:
-                self.logger.log_download_complete(filename, 0)
-                return True
-            elif existing_size > 0 and existing_size < file_size:
-                self.logger.logger.info(f"Resuming download of {filename} from {existing_size/(1024*1024):.1f}MB/{file_size/(1024*1024):.1f}MB")
-            else:
-                self.logger.logger.info(f"File {filename} exists but has incorrect size. Redownloading...")
-        
-        # Imposta lo stato del download
-        self.logger.log_download_start(filename, file_size)
-        
         try:
-            # Strategia 1: Per file piccoli (<10MB), prova un download veloce diretto
-            if file_size < 10 * 1024 * 1024 and self.curl_available:
-                self.logger.logger.info(f"Attempting fast download for {filename} ({file_size/(1024*1024):.1f}MB)...")
-                success = await self._fast_download(url, output_file, file_size)
-                if success:
-                    elapsed = time.time() - start_time
-                    self.logger.log_download_complete(filename, elapsed)
-                    return True
-                else:
-                    self.logger.logger.info("Fast download failed, switching to standard method...")
+            # Verifica attentamente il percorso di output
+            if output_file.endswith('/') or output_file.endswith('\\'):
+                # Il percorso termina con uno slash, dobbiamo aggiungere il nome del file
+                url_filename = os.path.basename(url.split('?')[0])
+                if not url_filename or url_filename == '':
+                    # Se non riusciamo a estrarre un nome file valido dall'URL, ne generiamo uno casuale
+                    url_filename = f"download_{int(time.time())}.bin"
+                output_file = os.path.join(output_file, url_filename)
             
-            # Strategia 2: Per file fino a 50MB, usa metodo standard
-            if file_size <= 50 * 1024 * 1024:
-                self.logger.logger.info(f"Attempting standard download for {filename} ({file_size/(1024*1024):.1f}MB)...")
-                if self.USE_EXTERNAL and (self.curl_available or self.wget_available):
-                    success = await self._download_with_external(url, output_file, file_size)
-                    if success:
-                        elapsed = time.time() - start_time
-                        self.logger.log_download_complete(filename, elapsed)
-                        return True
-                    else:
-                        self.logger.logger.info("Standard download failed, switching to conservative method...")
-                else:
-                    success = await self._download_with_aiohttp(url, output_file, file_size)
-                    if success:
-                        elapsed = time.time() - start_time
-                        self.logger.log_download_complete(filename, elapsed)
-                        return True
-                    else:
-                        self.logger.logger.info("Standard download failed, switching to conservative method...")
+            # Verifica che il percorso abbia un nome file e non sia solo una directory
+            output_dir = os.path.dirname(output_file)
+            output_filename = os.path.basename(output_file)
             
-            # Strategia 3: Per tutti i file, usa approccio conservativo con segmenti
-            self.logger.logger.info(f"Using conservative approach for {filename} ({file_size/(1024*1024):.1f}MB)...")
+            # Se il nome del file è vuoto, aggiungiamo un nome file
+            if not output_filename or output_filename == '':
+                url_filename = os.path.basename(url.split('?')[0])
+                if not url_filename or url_filename == '':
+                    url_filename = f"download_{int(time.time())}.bin"
+                output_file = os.path.join(output_dir, url_filename)
             
-            # Calcola il numero di chunk
-            chunk_size = self.download_options['segment_size']
-            total_chunks = math.ceil(file_size / chunk_size)
+            # Ora dovremmo avere un percorso con un nome file valido
+            self.logger.logger.info(f"Percorso di output finale: {output_file}")
             
-            # Crea il file temporaneo per i chunk
-            temp_file = output_file + ".part"
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
-            # Download dei chunk con backoff dinamico
-            for chunk_num in range(total_chunks):
-                start_byte = chunk_num * chunk_size
-                end_byte = min(start_byte + chunk_size - 1, file_size - 1)
-                
-                chunk_file = f"{temp_file}.chunk{chunk_num}"
-                
-                success = await self._download_chunk_with_backoff(
-                    url, chunk_file, start_byte, end_byte,
-                    chunk_num + 1, total_chunks, filename
-                )
-                
-                if not success:
-                    self.logger.log_download_error(filename, f"Failed at chunk {chunk_num + 1}")
-                    return False
+            # Get filename for logging
+            filename = os.path.basename(output_file)
             
-            # Unisci i chunk
-            self.logger.logger.info(f"Merging chunks for {filename}...")
-            with open(output_file, 'wb') as outfile:
-                for chunk_num in range(total_chunks):
-                    chunk_file = f"{temp_file}.chunk{chunk_num}"
-                    with open(chunk_file, 'rb') as infile:
-                        outfile.write(infile.read())
-                    os.remove(chunk_file)
+            start_time = time.time()
             
-            # Verifica dimensione finale
+            # Controlla se il file esiste già e ha la dimensione corretta
             if os.path.exists(output_file):
-                final_size = os.path.getsize(output_file)
-                if abs(final_size - file_size) <= 1024:  # Permette 1KB di differenza
-                    elapsed = time.time() - start_time
-                    self.logger.log_download_complete(filename, elapsed)
+                existing_size = os.path.getsize(output_file)
+                if existing_size == file_size:
+                    self.logger.log_download_complete(filename, 0)
+                    # Processa anche i file già scaricati
+                    await self.process_downloaded_file(output_file)
                     return True
+                elif existing_size > 0 and existing_size < file_size:
+                    self.logger.logger.info(f"Resuming download of {filename} from {existing_size/(1024*1024):.1f}MB/{file_size/(1024*1024):.1f}MB")
                 else:
-                    self.logger.log_download_error(filename, 
-                        f"Final size mismatch: expected {file_size}, got {final_size}")
+                    self.logger.logger.info(f"File {filename} exists but has incorrect size. Redownloading...")
             
-            return False
+            # Imposta lo stato del download
+            self.logger.log_download_start(filename, file_size)
             
+            try:
+                # Strategia 1: Per file piccoli (<10MB), prova un download veloce diretto
+                if file_size < 10 * 1024 * 1024 and self.curl_available:
+                    self.logger.logger.info(f"Attempting fast download for {filename} ({file_size/(1024*1024):.1f}MB)...")
+                    success = await self._fast_download(url, output_file, file_size)
+                    if success:
+                        elapsed = time.time() - start_time
+                        self.logger.log_download_complete(filename, elapsed)
+                        
+                        # Elaborazione post-download
+                        process_success = await self.process_downloaded_file(output_file)
+                        if not process_success:
+                            self.logger.logger.warning(f"Download completato ma elaborazione fallita per {filename}")
+                        
+                        return True
+                    else:
+                        self.logger.logger.info("Fast download failed, switching to standard method...")
+                
+                # Strategia 2: Per file fino a 50MB, usa metodo standard
+                if file_size <= 50 * 1024 * 1024:
+                    self.logger.logger.info(f"Attempting standard download for {filename} ({file_size/(1024*1024):.1f}MB)...")
+                    if self.USE_EXTERNAL and (self.curl_available or self.wget_available):
+                        success = await self._download_with_external(url, output_file, file_size)
+                        if success:
+                            elapsed = time.time() - start_time
+                            self.logger.log_download_complete(filename, elapsed)
+                            
+                            # Elaborazione post-download
+                            process_success = await self.process_downloaded_file(output_file)
+                            if not process_success:
+                                self.logger.logger.warning(f"Download completato ma elaborazione fallita per {filename}")
+                            
+                            return True
+                        else:
+                            self.logger.logger.info("Standard download failed, switching to conservative method...")
+                    else:
+                        success = await self._download_with_aiohttp(url, output_file, file_size)
+                        if success:
+                            elapsed = time.time() - start_time
+                            self.logger.log_download_complete(filename, elapsed)
+                            
+                            # Elaborazione post-download
+                            process_success = await self.process_downloaded_file(output_file)
+                            if not process_success:
+                                self.logger.logger.warning(f"Download completato ma elaborazione fallita per {filename}")
+                            
+                            return True
+                        else:
+                            self.logger.logger.info("Standard download failed, switching to conservative method...")
+                
+                # Strategia 3: Per tutti i file, usa approccio conservativo con segmenti
+                self.logger.logger.info(f"Using conservative approach for {filename} ({file_size/(1024*1024):.1f}MB)...")
+                
+                # Calcola il numero di chunk
+                chunk_size = self.download_options['segment_size']
+                total_chunks = math.ceil(file_size / chunk_size)
+                
+                # Crea il file temporaneo per i chunk
+                temp_file = output_file + ".part"
+                
+                # Download dei chunk con backoff dinamico
+                for chunk_num in range(total_chunks):
+                    start_byte = chunk_num * chunk_size
+                    end_byte = min(start_byte + chunk_size - 1, file_size - 1)
+                    
+                    chunk_file = f"{temp_file}.chunk{chunk_num}"
+                    
+                    success = await self._download_chunk_with_backoff(
+                        url, chunk_file, start_byte, end_byte,
+                        chunk_num + 1, total_chunks, filename
+                    )
+                    
+                    if not success:
+                        self.logger.log_download_error(filename, f"Failed at chunk {chunk_num + 1}")
+                        return False
+                
+                # Unisci i chunk
+                self.logger.logger.info(f"Merging chunks for {filename}...")
+                with open(output_file, 'wb') as outfile:
+                    for chunk_num in range(total_chunks):
+                        chunk_file = f"{temp_file}.chunk{chunk_num}"
+                        with open(chunk_file, 'rb') as infile:
+                            outfile.write(infile.read())
+                        os.remove(chunk_file)
+                
+                # Verifica dimensione finale
+                if os.path.exists(output_file):
+                    final_size = os.path.getsize(output_file)
+                    if abs(final_size - file_size) <= 1024:  # Permette 1KB di differenza
+                        elapsed = time.time() - start_time
+                        self.logger.log_download_complete(filename, elapsed)
+                        
+                        # Elaborazione post-download
+                        process_success = await self.process_downloaded_file(output_file)
+                        if not process_success:
+                            self.logger.logger.warning(f"Download completato ma elaborazione fallita per {filename}")
+                        
+                        return True
+                    else:
+                        self.logger.log_download_error(filename, 
+                            f"Final size mismatch: expected {file_size}, got {final_size}")
+                
+                return False
+                
+            except Exception as e:
+                self.logger.log_download_error(filename, str(e))
+                if filename not in self.download_state['failed_files']:
+                    self.download_state['failed_files'].append(filename)
+                self.save_state()
+                return False
         except Exception as e:
-            self.logger.log_download_error(filename, str(e))
-            if filename not in self.download_state['failed_files']:
-                self.download_state['failed_files'].append(filename)
-            self.save_state()
+            self.logger.logger.error(f"Errore nella preparazione del download: {str(e)}")
             return False
 
     async def _download_with_external(self, url, output_path, file_size, num_connections=1):
         """Download using external tools like curl or wget with enhanced error handling."""
         # Ensure the directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Get filename for logging
-        filename = os.path.basename(output_path)
-        
-        # Get options for download with reasonable defaults
-        limit_rate = self.download_options.get('limit_rate', 500)  # KB/s
-        max_retries = self.download_options.get('retries', 5)
-        retry_delay = 5  # Base delay for retries in seconds
-        
-        # Create a temporary cookie file - this helps with some server issues
-        cookie_file = os.path.join(os.path.dirname(output_path), ".cookies.txt")
-        if not os.path.exists(cookie_file):
-            with open(cookie_file, 'w') as f:
-                f.write("# Netscape HTTP Cookie File\n")
-        
-        # Check if we can resume download
-        continue_at = 0
-        if os.path.exists(output_path):
-            continue_at = os.path.getsize(output_path)
-            print(f"File {filename} trovato, riprendo da {continue_at/(1024*1024):.2f}MB")
-        
-        # Add a random delay before starting download (0-5 seconds)
-        # This simulates more human-like behavior
-        await asyncio.sleep(random.uniform(0, 5))
-        
-        # Try with both curl and wget if available
-        tools = []
-        if self.curl_available:
-            tools.append('curl')
-        if self.wget_available:
-            tools.append('wget')
-        
-        if not tools:
-            self.logger.error("Nessuno strumento di download (curl o wget) disponibile")
+        try:
+            # Verifica attentamente il percorso di output
+            if output_path.endswith('/') or output_path.endswith('\\'):
+                # Il percorso termina con uno slash, dobbiamo aggiungere il nome del file
+                url_filename = os.path.basename(url.split('?')[0])
+                if not url_filename or url_filename == '':
+                    # Se non riusciamo a estrarre un nome file valido dall'URL, ne generiamo uno casuale
+                    url_filename = f"download_{int(time.time())}.bin"
+                output_path = os.path.join(output_path, url_filename)
+            
+            # Verifica che il percorso abbia un nome file e non sia solo una directory
+            output_dir = os.path.dirname(output_path)
+            output_filename = os.path.basename(output_path)
+            
+            # Se il nome del file è vuoto, aggiungiamo un nome file
+            if not output_filename or output_filename == '':
+                url_filename = os.path.basename(url.split('?')[0])
+                if not url_filename or url_filename == '':
+                    url_filename = f"download_{int(time.time())}.bin"
+                output_path = os.path.join(output_dir, url_filename)
+            
+            # Ora dovremmo avere un percorso con un nome file valido
+            self.logger.logger.info(f"Percorso di output finale: {output_path}")
+            
+            # Assicurati che la directory esista
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Get filename for logging
+            filename = os.path.basename(output_path)
+            
+            # Print output path for debugging
+            self.logger.logger.info(f"Output path for download: {output_path}")
+            
+            # Get options for download with reasonable defaults
+            limit_rate = self.download_options.get('limit_rate', 500)  # KB/s
+            max_retries = self.download_options.get('retries', 5)
+            retry_delay = 5  # Base delay for retries in seconds
+            
+            # Create a temporary cookie file - this helps with some server issues
+            cookie_file = os.path.join(os.path.dirname(output_path), ".cookies.txt")
+            if not os.path.exists(cookie_file):
+                with open(cookie_file, 'w') as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+            
+            # Check if we can resume download
+            continue_at = 0
+            if os.path.exists(output_path):
+                continue_at = os.path.getsize(output_path)
+                print(f"File {filename} trovato, riprendo da {continue_at/(1024*1024):.2f}MB")
+            
+            # Add a random delay before starting download (0-5 seconds)
+            # This simulates more human-like behavior
+            await asyncio.sleep(random.uniform(0, 5))
+            
+            # Try with both curl and wget if available
+            tools = []
+            if self.curl_available:
+                tools.append('curl')
+            if self.wget_available:
+                tools.append('wget')
+            
+            if not tools:
+                self.logger.error("Nessuno strumento di download (curl o wget) disponibile")
+                return False
+            
+            # Shuffle the tools to try different approaches
+            random.shuffle(tools)
+            
+            # For particularly problematic files (like those with error 18),
+            # try even more conservative approaches
+            conservative_options = [
+                {'limit_rate': limit_rate},  # Standard
+                {'limit_rate': limit_rate // 2},  # Half speed
+                {'limit_rate': 100, 'no_keepalive': True},  # Very slow with no keepalive
+                {'limit_rate': 50, 'no_keepalive': True, 'disable_epsv': True},  # Ultra conservative
+            ]
+        except Exception as e:
+            self.logger.logger.error(f"Errore nella preparazione del download: {str(e)}")
             return False
-        
-        # Shuffle the tools to try different approaches
-        random.shuffle(tools)
-        
-        # For particularly problematic files (like those with error 18),
-        # try even more conservative approaches
-        conservative_options = [
-            {'limit_rate': limit_rate},  # Standard
-            {'limit_rate': limit_rate // 2},  # Half speed
-            {'limit_rate': 100, 'no_keepalive': True},  # Very slow with no keepalive
-            {'limit_rate': 50, 'no_keepalive': True, 'disable_epsv': True},  # Ultra conservative
-        ]
         
         for retry in range(max_retries):
             for tool in tools:
@@ -1642,148 +1800,553 @@ class ANACScraper:
                     if avg_speed > 0:
                         eta_seconds = remaining_bytes / avg_speed
                         eta_str = self._format_time(eta_seconds)
-                    else:
-                        eta_str = "sconosciuto"
-                    
-                    # Display progress
-                    percent = (current_size / total_size) * 100
-                    progress_bar = self._get_progress_bar(percent)
-                    
-                    print(f"\r{progress_bar} {percent:.1f}% "
-                          f"({current_size/(1024*1024):.1f}/{total_size/(1024*1024):.1f}MB) "
-                          f"@ {avg_speed/1024:.1f}KB/s, ETA: {eta_str}", end="")
+                        
+                        # Calculate percentage
+                        percentage = (current_size / total_size) * 100 if total_size > 0 else 0
+                        
+                        # Update previous values for next iteration
+                        prev_size = current_size
+                        prev_time = current_time
+                        
+                        # Log progress
+                        self.logger.logger.info(
+                            f"Download progress for {os.path.basename(file_path)}: "
+                            f"{percentage:.1f}% ({self._format_size(current_size)}/{self._format_size(total_size)}) "
+                            f"- Speed: {avg_speed/1024:.1f} KB/s - ETA: {eta_str}"
+                        )
+                        
+                        # Visualizza barra di progresso
+                        progress_bar = self._get_progress_bar(percentage)
+                        print(f"\r{progress_bar} {percentage:.1f}% - {avg_speed/1024:.1f} KB/s - ETA: {eta_str}", end="")
                 
-                prev_size = current_size
-                prev_time = current_time
-        
+                await asyncio.sleep(1)  # Check every second
+                
+            print()  # New line after progress bar
+            return True
+            
         except Exception as e:
-            print(f"\nErrore durante il monitoraggio del download: {str(e)}")
-
-    async def __aenter__(self):
-        self.logger.logger.info("Creating aiohttp session...")
-        self.session = aiohttp.ClientSession(headers=self.headers)
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            self.logger.logger.info("Closing aiohttp session...")
-            await self.session.close()
+            self.logger.logger.error(f"Error monitoring download progress: {str(e)}")
+            return False
     
-    async def _make_request(self, url: str) -> str:
-        """Make an HTTP request and return the response text."""
-        try:
-            # Ensure URL is absolute
-            if not url.startswith('http'):
-                url = f"{self.base_url}{url}"
-            
-            # Applica rate limiting
-            await self.rate_limiter.acquire()
-            
-            self.logger.logger.info(f"Making request to: {url}")
-            async with self.session.get(url, timeout=self.timeout, allow_redirects=True) as response:
-                response.raise_for_status()
-                self.logger.logger.info(f"Request successful: {response.status}")
-                
-                # Salva i cookie per richieste future
-                if response.cookies:
-                    for cookie in response.cookies.values():
-                        self.cookies[cookie.key] = cookie.value
-                        self.logger.logger.debug(f"Cookie saved: {cookie.key}")
-                
-                return await response.text()
-        except aiohttp.ClientError as e:
-            self.logger.logger.error(f"Error making request to {url}: {str(e)}")
-            raise
-    
+    # Qui inizia la funzione get_dataset_pages, che era mescolata impropriamente
     async def get_dataset_pages(self) -> List[str]:
-        """Get all available dataset pages, handling pagination."""
+        """Get all dataset pages, handling pagination correctly."""
         try:
-            all_dataset_links = []
-            page = 1
-            max_pages = 10  # Limite di sicurezza
-            has_more_pages = True
+            # Start with the first page
+            base_path = '/opendata/dataset'
+            dataset_pages = []
             
-            self.logger.logger.info("Recupero di tutti i dataset con paginazione...")
+            # Keep track of URLs we've already seen to avoid duplicates
+            seen_urls = set()
             
-            while has_more_pages and page <= max_pages:
-                self.logger.logger.info(f"Recupero pagina {page} dei dataset...")
+            # Inizializza contatore per il logging
+            dataset_counter = 0
+            
+            self.logger.logger.info("Inizio ricerca di tutti i dataset disponibili...")
+            
+            # Numero minimo di pagine conosciute
+            min_pages = 5  # Sappiamo che ci sono almeno 5 pagine
+            
+            # Variabili per la ricerca dinamica di pagine
+            current_page = 1
+            found_new_page = True
+            max_pages_to_try = 20  # Limitiamo la ricerca a un massimo ragionevole per evitare loop infiniti
+            consecutive_empty_pages = 0  # Contatore per pagine consecutive senza dataset
+            max_consecutive_empty = 2    # Numero massimo di pagine vuote consecutive prima di fermarsi
+            
+            # Continua a cercare pagine finché vengono trovati nuovi dataset o raggiunto il limite
+            while (current_page <= max_pages_to_try) and (current_page <= min_pages or found_new_page) and consecutive_empty_pages < max_consecutive_empty:
+                self.logger.logger.info(f"Recupero pagina {current_page} dei dataset...")
+                found_new_page = False  # Resettiamo per questa iterazione
                 
-                # Construct URL with page parameter
-                if page == 1:
-                    url = "/opendata/dataset"
+                # Construct the URL for the current page
+                if current_page == 1:
+                    url = base_path
                 else:
-                    url = f"/opendata/dataset?page={page}"
+                    url = f"{base_path}?page={current_page}"
                 
-                # Add random delay between page requests
-                if page > 1:
-                    delay = random.uniform(3, 7)
-                    self.logger.logger.info(f"Attesa di {delay:.1f}s prima di recuperare la pagina successiva...")
-                    await asyncio.sleep(delay)
+                # Get the HTML with retry logic
+                html = None
+                max_retries = 3
+                for retry in range(max_retries):
+                    html = await self._make_request(url)
+                    if html:
+                        break
+                    self.logger.logger.warning(f"Tentativo {retry+1}/{max_retries} fallito per la pagina {current_page}")
+                    await asyncio.sleep(random.uniform(5, 10))  # Attesa più lunga tra i tentativi
                 
-                html = await self._make_request(url)
+                if not html:
+                    self.logger.logger.error(f"Impossibile recuperare la pagina {current_page} dopo {max_retries} tentativi")
+                    # Se non riusciamo a recuperare una pagina oltre il minimo conosciuto, interrompiamo
+                    if current_page > min_pages:
+                        consecutive_empty_pages += 1
+                        if consecutive_empty_pages >= max_consecutive_empty:
+                            self.logger.logger.warning(f"Trovate {consecutive_empty_pages} pagine vuote consecutive. Interrompo la ricerca.")
+                            break
+                    # Altrimenti continuiamo con la prossima pagina
+                    current_page += 1
+                    continue
+                
+                # Parse the HTML
                 soup = BeautifulSoup(html, 'html.parser')
                 
                 # Find all dataset links on this page
-                page_links = []
-                for link in soup.find_all('a', href=True):
-                    href = link['href']
-                    if '/opendata/dataset/' in href and not href.endswith('/opendata/dataset/'):
-                        # Normalize URL (remove query parameters, etc.)
-                        href = href.split('?')[0]
-                        if href not in all_dataset_links and href not in page_links:
-                            self.logger.logger.debug(f"Found dataset link: {href}")
-                            page_links.append(href)
+                dataset_links = []
+                initial_dataset_count = len(dataset_pages)
                 
-                # Check if we found any new links on this page
-                if page_links:
-                    self.logger.logger.info(f"Trovati {len(page_links)} dataset nella pagina {page}")
-                    all_dataset_links.extend(page_links)
+                # Look for dataset cards (main way to find datasets)
+                self._find_dataset_links(soup, dataset_links, seen_urls, base_path)
+                
+                # Find direct dataset cards in search results
+                self._find_dataset_cards(soup, dataset_links, seen_urls)
+                
+                # Trova informazioni sulla paginazione per aggiornare min_pages
+                pagination = soup.find('ul', class_='pagination')
+                if pagination:
+                    page_links = pagination.find_all('a', href=True)
                     
-                    # Check if there's a "next page" link
-                    next_page_link = soup.find('a', class_='pagination-next')
-                    if next_page_link and 'disabled' not in next_page_link.get('class', []):
-                        page += 1
-                    else:
-                        has_more_pages = False
-                        self.logger.logger.info("Nessuna pagina successiva trovata.")
+                    for link in page_links:
+                        href = link['href']
+                        match = re.search(r'page=(\d+)', href)
+                        if match:
+                            page_num = int(match.group(1))
+                            min_pages = max(min_pages, page_num)
+                    
+                    # Cerca anche l'ultimo link che di solito porta all'ultima pagina
+                    last_link = pagination.find('a', class_=['last', 'next', 'pagination-last'])
+                    if last_link and 'href' in last_link.attrs:
+                        href = last_link['href']
+                        match = re.search(r'page=(\d+)', href)
+                        if match:
+                            page_num = int(match.group(1))
+                            min_pages = max(min_pages, page_num)
+                
+                # Log dei dataset trovati in questa pagina
+                self.logger.logger.info(f"Trovati {len(dataset_links)} dataset nella pagina {current_page}")
+                
+                # Se non ci sono dataset in questa pagina, incrementa il contatore di pagine vuote
+                if len(dataset_links) == 0:
+                    consecutive_empty_pages += 1
+                    self.logger.logger.warning(f"Pagina {current_page} vuota. Pagine vuote consecutive: {consecutive_empty_pages}/{max_consecutive_empty}")
+                    
+                    # Se abbiamo raggiunto il massimo di pagine vuote consecutive, interrompiamo
+                    if consecutive_empty_pages >= max_consecutive_empty and current_page > min_pages:
+                        self.logger.logger.warning(f"Trovate {consecutive_empty_pages} pagine vuote consecutive. Interrompo la ricerca.")
+                        break
                 else:
-                    has_more_pages = False
-                    self.logger.logger.info("Nessun dataset trovato nella pagina corrente.")
+                    # Se abbiamo trovato dataset, resettiamo il contatore di pagine vuote
+                    consecutive_empty_pages = 0
+                
+                # Add unique dataset links to our result list
+                for link in dataset_links:
+                    if link not in dataset_pages:
+                        # Assicuriamo che l'URL sia assoluto
+                        if not link.startswith('http'):
+                            if not link.startswith('/'):
+                                link = f"/{link}"
+                            link = f"{self.base_url}{link}"
+                        
+                        dataset_pages.append(link)
+                        dataset_counter += 1
+                
+                # Verifica se abbiamo trovato nuovi dataset in questa pagina
+                if len(dataset_pages) > initial_dataset_count:
+                    found_new_page = True
+                
+                # Log progress
+                self.logger.logger.info(f"Totale dataset trovati finora: {len(dataset_pages)} (minimo pagine rilevate: {min_pages})")
+                
+                # Move to the next page
+                current_page += 1
+                
+                # Add delay to avoid overloading the server
+                await asyncio.sleep(random.uniform(3, 5))
             
-            # Remove duplicates and sort
-            all_dataset_links = sorted(list(set(all_dataset_links)))
-            self.logger.logger.info(f"Trovati {len(all_dataset_links)} dataset totali in {page} pagine")
+            self.logger.logger.info(f"Completata scansione di {current_page-1} pagine. Minimo pagine rilevate: {min_pages}")
             
-            return all_dataset_links
+            # Se non abbiamo trovato almeno 64 dataset, tenta di costruire i link direttamente
+            if len(dataset_pages) < 64:
+                self.logger.logger.warning(f"Trovati solo {len(dataset_pages)} dataset. Provo a costruire link aggiuntivi.")
+                # Prova ad aggiungere link ai dataset noti per OCDS, SmartCIG e CUP
+                known_patterns = [
+                    "ocds-appalti-ordinari-",
+                    "ocds-appalti-ordinari_",
+                    "ocds-appalti-",
+                    "smartcig-",
+                    "smartcig_", 
+                    "cup-",
+                    "cup_",
+                    "dati-",
+                    "anticorruzione-",
+                    "anac-"
+                ]
+                
+                # Anni da considerare
+                years = list(range(2016, datetime.now().year + 1))
+                
+                # Genera combinazioni di pattern e anni
+                for pattern in known_patterns:
+                    for year in years:
+                        for quarter in range(1, 5):
+                            # Diverse possibili varianti di formato
+                            variants = [
+                                f"{pattern}{year}",
+                                f"{pattern}{year}-q{quarter}",
+                                f"{pattern}{year}_q{quarter}",
+                                f"{pattern}{year}_trim{quarter}",
+                                f"{pattern}{year}-trim{quarter}"
+                            ]
+                            
+                            for variant in variants:
+                                dataset_url = f"{self.base_url}/opendata/dataset/{variant}"
+                                if dataset_url not in dataset_pages and dataset_url not in seen_urls:
+                                    dataset_pages.append(dataset_url)
+                                    seen_urls.add(dataset_url)
+                                    self.logger.logger.info(f"Aggiunto dataset construito: {dataset_url}")
+            
+            # After parsing all pages, save the list of dataset URLs to a file for reference
+            with open('dataset_urls.txt', 'w') as f:
+                for url in dataset_pages:
+                    f.write(f"{url}\n")
+            
+            self.logger.logger.info(f"Dataset totali trovati: {len(dataset_pages)}")
+            
+            return dataset_pages
             
         except Exception as e:
-            self.logger.logger.error(f"Error getting dataset pages: {str(e)}")
+            self.logger.logger.error(f"Errore nel recupero dei dataset: {str(e)}")
             raise
+
+    async def _process_special_page(self, page_url, dataset_pages, seen_urls):
+        """Process a special page (organization, group) to find datasets."""
+        try:
+            self.logger.logger.info(f"Verifico datasets nella pagina: {page_url}")
+            
+            # Get the page
+            page_html = await self._make_request(page_url)
+            if not page_html:
+                return
+                
+            page_soup = BeautifulSoup(page_html, 'html.parser')
+            
+            # Cerca dataset diretti in questa pagina
+            for link in page_soup.find_all('a', href=True):
+                href = link['href']
+                # Normalizza URL
+                if '?' in href:
+                    href = href.split('?')[0]
+                    
+                if '/opendata/dataset/' in href and href not in seen_urls:
+                    # Make sure we're not getting pagination links
+                    if '/opendata/dataset?page=' not in href:
+                        # Add to dataset_pages directly
+                        if href not in dataset_pages:
+                            # Assicuriamo che l'URL sia assoluto
+                            if not href.startswith('http'):
+                                if not href.startswith('/'):
+                                    href = f"/{href}"
+                                href = f"{self.base_url}{href}"
+                            
+                            dataset_pages.append(href)
+                        seen_urls.add(href)
+            
+            # Cerca se ci sono pagine di paginazione (nel caso di più dataset nella stessa organizzazione/gruppo)
+            pagination = page_soup.find('ul', class_='pagination')
+            if pagination:
+                page_links = pagination.find_all('a', href=True)
+                max_page = 1
+                
+                # Trova il numero massimo di pagina
+                for link in page_links:
+                    href = link['href']
+                    match = re.search(r'page=(\d+)', href)
+                    if match:
+                        page_num = int(match.group(1))
+                        max_page = max(max_page, page_num)
+                
+                # Visita ogni pagina dell'organizzazione se ce ne sono più di una
+                for page_num in range(2, max_page + 1):  # Inizia da 2 perché la pagina 1 l'abbiamo già analizzata
+                    pagination_url = f"{page_url}?page={page_num}"
+                    
+                    self.logger.logger.info(f"Verifico pagina aggiuntiva: {pagination_url}")
+                    
+                    # Aggiungi ritardo
+                    await asyncio.sleep(random.uniform(1, 2))
+                    
+                    # Ottieni la pagina
+                    page_html = await self._make_request(pagination_url)
+                    if not page_html:
+                        continue
+                        
+                    page_soup = BeautifulSoup(page_html, 'html.parser')
+                    
+                    # Cerca dataset in questa pagina
+                    for link in page_soup.find_all('a', href=True):
+                        href = link['href']
+                        if '?' in href:
+                            href = href.split('?')[0]
+                            
+                        if '/opendata/dataset/' in href and href not in seen_urls:
+                            if '/opendata/dataset?page=' not in href:
+                                if href not in dataset_pages:
+                                    # Assicuriamo che l'URL sia assoluto
+                                    if not href.startswith('http'):
+                                        if not href.startswith('/'):
+                                            href = f"/{href}"
+                                        href = f"{self.base_url}{href}"
+                                    
+                                    dataset_pages.append(href)
+                                seen_urls.add(href)
+        except Exception as e:
+            self.logger.logger.error(f"Errore nel processare la pagina speciale {page_url}: {str(e)}")
+
+    async def _process_organization_page(self, org_url, dataset_links, seen_urls, base_path):
+        """Process an organization page to find datasets."""
+        try:
+            self.logger.logger.info(f"Verifico datasets nell'organizzazione: {org_url}")
+            
+            # Add delay to avoid overloading the server
+            await asyncio.sleep(random.uniform(1, 2))
+            
+            # Get the organization page
+            org_html = await self._make_request(org_url)
+            if not org_html:
+                return
+                
+            org_soup = BeautifulSoup(org_html, 'html.parser')
+            
+            # Find all dataset links on the organization page
+            for org_link in org_soup.find_all('a', href=True):
+                org_href = org_link['href']
+                # Normalizza URL
+                if '?' in org_href:
+                    org_href = org_href.split('?')[0]
+                    
+                if '/opendata/dataset/' in org_href and org_href not in seen_urls:
+                    # Make sure we're not getting pagination links
+                    if '/opendata/dataset?page=' not in org_href and org_href != base_path:
+                        # Aggiungi alla lista
+                        dataset_links.append(org_href)
+                        seen_urls.add(org_href)
+            
+            # Cerca paginazione nell'organizzazione
+            pagination = org_soup.find('ul', class_='pagination')
+            if pagination:
+                page_links = pagination.find_all('a', href=True)
+                max_page = 1
+                
+                for link in page_links:
+                    href = link['href']
+                    match = re.search(r'page=(\d+)', href)
+                    if match:
+                        page_num = int(match.group(1))
+                        max_page = max(max_page, page_num)
+                
+                # Visita ogni pagina dell'organizzazione
+                for page_num in range(2, max_page + 1):
+                    page_url = f"{org_url}?page={page_num}"
+                    
+                    await asyncio.sleep(random.uniform(1, 2))
+                    
+                    page_html = await self._make_request(page_url)
+                    if not page_html:
+                        continue
+                        
+                    page_soup = BeautifulSoup(page_html, 'html.parser')
+                    
+                    for link in page_soup.find_all('a', href=True):
+                        href = link['href']
+                        if '?' in href:
+                            href = href.split('?')[0]
+                            
+                        if '/opendata/dataset/' in href and href not in seen_urls:
+                            if '/opendata/dataset?page=' not in href and href != base_path:
+                                dataset_links.append(href)
+                                seen_urls.add(href)
+        except Exception as e:
+            self.logger.logger.error(f"Errore nel processare la pagina dell'organizzazione {org_url}: {str(e)}")
+
+    def _find_dataset_links(self, soup, dataset_links, seen_urls, base_path):
+        """Find all dataset links in a page."""
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            # Normalizza URL (rimuovi parametri di query, ecc.)
+            if '?' in href:
+                href = href.split('?')[0]
+                
+            if '/opendata/dataset/' in href and href not in seen_urls:
+                # Make sure we're not getting pagination links
+                if '/opendata/dataset?page=' not in href and href != base_path:
+                    # Aggiungi alla lista
+                    dataset_links.append(href)
+                    seen_urls.add(href)
+
+    def _find_dataset_cards(self, soup, dataset_links, seen_urls):
+        """Find all dataset cards in a page."""
+        # Cerca tutte le possibili classi di card dei dataset
+        dataset_cards = soup.find_all('div', class_=[
+            'dataset-card', 'dataset-item', 'card', 'package-card',
+            'dataset', 'dataset-heading', 'dataset-resources'
+        ])
+        
+        for card in dataset_cards:
+            links = card.find_all('a', href=True)
+            for link in links:
+                href = link['href']
+                # Normalizza URL
+                if '?' in href:
+                    href = href.split('?')[0]
+                    
+                if '/opendata/dataset/' in href and href not in seen_urls:
+                    # Aggiungi alla lista
+                    dataset_links.append(href)
+                    seen_urls.add(href)
+
+    def _update_pagination_info(self, soup, current_page, total_pages):
+        """Update total_pages based on pagination information."""
+        # Find pagination information to update total_pages
+        pagination = soup.find('ul', class_='pagination')
+        if pagination:
+            page_links = pagination.find_all('a', href=True)
+            for link in page_links:
+                href = link['href']
+                match = re.search(r'page=(\d+)', href)
+                if match:
+                    page_num = int(match.group(1))
+                    total_pages = max(total_pages, page_num)
+            
+            # Cerca anche l'ultimo link che di solito porta all'ultima pagina
+            last_link = pagination.find('a', class_=['last', 'next', 'pagination-last'])
+            if last_link and 'href' in last_link.attrs:
+                href = last_link['href']
+                match = re.search(r'page=(\d+)', href)
+                if match:
+                    page_num = int(match.group(1))
+                    total_pages = max(total_pages, page_num)
     
     async def get_json_files(self, dataset_url: str) -> List[Dict[str, str]]:
-        """Get all JSON and ZIP files from a dataset page, checking all resource pages."""
+        """Get all JSON and ZIP files from a dataset page, checking all resource pages and subpages."""
         try:
             self.logger.logger.info(f"Recupero file JSON dal dataset: {dataset_url}")
             files = []
             
             # Get the main dataset page
             html = await self._make_request(dataset_url)
+            if not html:
+                self.logger.logger.error(f"Impossibile recuperare la pagina del dataset: {dataset_url}")
+                return []
+                
             soup = BeautifulSoup(html, 'html.parser')
+            
+            # Prima cerca tutte le possibili risorse nella pagina
+            resource_containers = [
+                # Cerca nelle liste di risorse
+                soup.find_all('div', class_='resource-list'),
+                # Cerca nelle griglie di risorse
+                soup.find_all('div', class_='resource-grid'),
+                # Cerca nelle tabelle di risorse
+                soup.find_all('table', class_='table'),
+                # Cerca in qualsiasi contenitore con risorse
+                soup.find_all('div', class_=['dataset-resources', 'resources', 'data-resources']),
+                # Cerca direttamente i link di download
+                soup.find_all('a', class_=['resource-url-analytics', 'btn-primary', 'download', 'download-resource']),
+                # Cerca in contenitori generici
+                soup.find_all('div', class_=['dataset-content', 'dataset-resources', 'module-content'])
+            ]
+            
+            # Appiattire la lista
+            resource_containers = [item for sublist in resource_containers for item in sublist]
+            
+            # Cerca anche nelle pagine dei gruppi di dati
+            group_links = []
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                # Cerca link ai gruppi (spesso contengono datasets multipli)
+                if '/opendata/dataset/' in href and ('#group' in href or '/group/' in href or '/resource/' in href):
+                    if href not in group_links:
+                        group_links.append(href)
+            
+            # Cerca anche filtri e categorie che potrebbero contenere risorse
+            category_links = []
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if ('/category/' in href or '/tag/' in href or '/organization/' in href) and href not in category_links:
+                    category_links.append(href)
+            
+            # Helper function per assicurarsi che gli URL siano assoluti e normalizzati
+            def normalize_url(url):
+                # Se l'URL già inizia con http, è già assoluto
+                if url.startswith('http'):
+                    return url
+                # Altrimenti, aggiungi il dominio base
+                if not url.startswith('/'):
+                    url = f"/{url}"
+                return f"{self.base_url}{url}"
+            
+            # Ricerca nei contenitori di risorse
+            for container in resource_containers:
+                for link in container.find_all('a', href=True):
+                    href = link['href']
+                    if self._is_json_or_zip_file(href):
+                        filename = href.split('/')[-1]
+                        # Normalizza URL
+                        normalized_url = normalize_url(href)
+                        self.logger.logger.debug(f"Found file in resource container: {filename} at {normalized_url}")
+                        if not any(f['url'] == normalized_url for f in files):
+                            files.append({
+                                'url': normalized_url,
+                                'filename': filename,
+                                'size': None  # Will be filled during download
+                            })
             
             # First, look for direct file links on the main page
             for link in soup.find_all('a', href=True):
                 href = link['href']
                 if self._is_json_or_zip_file(href):
                     filename = href.split('/')[-1]
-                    # Ensure URL is absolute
-                    if not href.startswith('http'):
-                        href = f"{self.base_url}{href}"
-                    self.logger.logger.debug(f"Found file on main page: {filename} at {href}")
-                    files.append({
-                        'url': href,
-                        'filename': filename,
-                        'size': None  # Will be filled during download
-                    })
+                    # Normalizza URL
+                    normalized_url = normalize_url(href)
+                    self.logger.logger.debug(f"Found file on main page: {filename} at {normalized_url}")
+                    if not any(f['url'] == normalized_url for f in files):
+                        files.append({
+                            'url': normalized_url,
+                            'filename': filename,
+                            'size': None  # Will be filled during download
+                        })
+            
+            # Processa i gruppi di dati per trovare file aggiuntivi
+            for i, group_url in enumerate(group_links):
+                if i > 0:  # Add delay between requests
+                    await asyncio.sleep(random.uniform(1, 3))
+                
+                normalized_group_url = normalize_url(group_url)
+                self.logger.logger.info(f"Checking group page {i+1}/{len(group_links)}: {normalized_group_url}")
+                
+                try:
+                    group_html = await self._make_request(normalized_group_url)
+                    if not group_html:
+                        self.logger.logger.error(f"Impossibile recuperare la pagina del gruppo: {normalized_group_url}")
+                        continue
+                        
+                    group_soup = BeautifulSoup(group_html, 'html.parser')
+                    
+                    # Cerca file JSON nei gruppi
+                    for g_link in group_soup.find_all('a', href=True):
+                        g_href = g_link['href']
+                        if self._is_json_or_zip_file(g_href):
+                            filename = g_href.split('/')[-1]
+                            normalized_url = normalize_url(g_href)
+                            
+                            # Check if we already found this file
+                            if not any(f['url'] == normalized_url for f in files):
+                                self.logger.logger.debug(f"Found file in group: {filename} at {normalized_url}")
+                                files.append({
+                                    'url': normalized_url,
+                                    'filename': filename,
+                                    'size': None
+                                })
+                except Exception as e:
+                    self.logger.logger.error(f"Error processing group page {normalized_group_url}: {str(e)}")
             
             # Then check if there are resource pages with more files
             resource_links = []
@@ -1798,15 +2361,16 @@ class ANACScraper:
                 if i > 0:  # Add delay between resource page requests
                     await asyncio.sleep(random.uniform(2, 5))
                 
-                self.logger.logger.info(f"Checking resource page {i+1}/{len(resource_links)}: {resource_url}")
-                
-                # Ensure URL is absolute
-                if not resource_url.startswith('http'):
-                    resource_url = f"{self.base_url}{resource_url}"
+                normalized_resource_url = normalize_url(resource_url)
+                self.logger.logger.info(f"Checking resource page {i+1}/{len(resource_links)}: {normalized_resource_url}")
                 
                 try:
                     # Get the resource page
-                    resource_html = await self._make_request(resource_url)
+                    resource_html = await self._make_request(normalized_resource_url)
+                    if not resource_html:
+                        self.logger.logger.error(f"Impossibile recuperare la pagina della risorsa: {normalized_resource_url}")
+                        continue
+                        
                     resource_soup = BeautifulSoup(resource_html, 'html.parser')
                     
                     # Look for JSON or ZIP files on the resource page
@@ -1814,20 +2378,18 @@ class ANACScraper:
                         r_href = r_link['href']
                         if self._is_json_or_zip_file(r_href):
                             filename = r_href.split('/')[-1]
-                            # Ensure URL is absolute
-                            if not r_href.startswith('http'):
-                                r_href = f"{self.base_url}{r_href}"
+                            normalized_url = normalize_url(r_href)
                             
                             # Check if we already found this file
-                            if not any(f['url'] == r_href for f in files):
-                                self.logger.logger.debug(f"Found file on resource page: {filename} at {r_href}")
+                            if not any(f['url'] == normalized_url for f in files):
+                                self.logger.logger.debug(f"Found file on resource page: {filename} at {normalized_url}")
                                 files.append({
-                                    'url': r_href,
+                                    'url': normalized_url,
                                     'filename': filename,
                                     'size': None  # Will be filled during download
                                 })
                 except Exception as e:
-                    self.logger.logger.error(f"Error processing resource page {resource_url}: {str(e)}")
+                    self.logger.logger.error(f"Error processing resource page {normalized_resource_url}: {str(e)}")
                     # Continue with other resource pages
             
             # Look for direct download URLs that might be embedded in the page
@@ -1836,31 +2398,70 @@ class ANACScraper:
                 href = button.get('href')
                 if href and self._is_json_or_zip_file(href):
                     filename = href.split('/')[-1]
-                    # Ensure URL is absolute
-                    if not href.startswith('http'):
-                        href = f"{self.base_url}{href}"
+                    normalized_url = normalize_url(href)
                     
                     # Check if we already found this file
-                    if not any(f['url'] == href for f in files):
-                        self.logger.logger.debug(f"Found file via download button: {filename} at {href}")
+                    if not any(f['url'] == normalized_url for f in files):
+                        self.logger.logger.debug(f"Found file in resource section: {filename} at {normalized_url}")
                         files.append({
-                            'url': href,
+                            'url': normalized_url,
                             'filename': filename,
                             'size': None  # Will be filled during download
                         })
+            
+            # Ricerca specifica per file CUP e SmartCIG
+            special_indicators = ['cup', 'smartcig', 'appalti', 'contratti', 'anac', 'gare']
+            for indicator in special_indicators:
+                # Cerca link con testo contenente l'indicatore
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if (indicator in link.text.lower() or indicator in href.lower()) and self._is_json_or_zip_file(href):
+                        filename = href.split('/')[-1]
+                        if not filename:
+                            filename = f"{indicator}_file_{int(time.time())}.json"
+                        normalized_url = normalize_url(href)
+                        
+                        # Check if we already found this file
+                        if not any(f['url'] == normalized_url for f in files):
+                            self.logger.logger.debug(f"Found {indicator} file: {filename} at {normalized_url}")
+                            files.append({
+                                'url': normalized_url,
+                                'filename': filename,
+                                'size': None  # Will be filled during download
+                            })
             
             self.logger.logger.info(f"Trovati {len(files)} file JSON/ZIP nel dataset")
             return files
             
         except Exception as e:
             self.logger.logger.error(f"Error getting JSON files from {dataset_url}: {str(e)}")
-            raise
+            return []
     
     def _is_json_or_zip_file(self, url: str) -> bool:
-        """Check if a URL points to a JSON or ZIP file."""
+        """Check if a URL points to a JSON or ZIP file containing JSON data."""
         url_lower = url.lower()
-        return (url_lower.endswith('.json') or 
-                url_lower.endswith('.zip') and 'json' in url_lower)
+        
+        # Controllo diretto estensioni
+        is_json = url_lower.endswith('.json')
+        
+        # Migliorato il rilevamento di ZIP contenenti JSON
+        is_json_zip = (url_lower.endswith('.zip') and 
+                      ('json' in url_lower or '_json' in url_lower or 'json-' in url_lower))
+        
+        # Pattern specifici per ANAC, inclusi CUP e SmartCIG
+        contains_json_indicators = any(indicator in url_lower for indicator in 
+                                   ['jsonl', 'json-ld', 'geojson', 'json_data', 'data.json',
+                                    'stazioni-appaltanti_json', 'dataset.json', 'cup', 'smartcig',
+                                    'appalti', 'contratti'])
+        
+        # Verifica parametri URL che indicano un file JSON
+        has_json_params = 'format=json' in url_lower or 'type=json' in url_lower
+        
+        # Verifica pattern URL specifici ANAC
+        is_anac_json_path = '/opendata/download/dataset/' in url_lower and (
+            'json' in url_lower or 'cup' in url_lower or 'smartcig' in url_lower)
+        
+        return is_json or is_json_zip or contains_json_indicators or has_json_params or is_anac_json_path
     
     async def get_csv_files(self, dataset_url: str) -> List[Dict[str, str]]:
         """Get all CSV files from a dataset page, checking all resource pages."""
@@ -1870,19 +2471,32 @@ class ANACScraper:
             
             # Get the main dataset page
             html = await self._make_request(dataset_url)
+            if not html:
+                self.logger.logger.error(f"Impossibile recuperare la pagina del dataset: {dataset_url}")
+                return []
+                
             soup = BeautifulSoup(html, 'html.parser')
+            
+            # Helper function per assicurarsi che gli URL siano assoluti e normalizzati
+            def normalize_url(url):
+                # Se l'URL già inizia con http, è già assoluto
+                if url.startswith('http'):
+                    return url
+                # Altrimenti, aggiungi il dominio base
+                if not url.startswith('/'):
+                    url = f"/{url}"
+                return f"{self.base_url}{url}"
             
             # First, look for direct file links on the main page
             for link in soup.find_all('a', href=True):
                 href = link['href']
                 if href.lower().endswith('.csv'):
                     filename = href.split('/')[-1]
-                    # Ensure URL is absolute
-                    if not href.startswith('http'):
-                        href = f"{self.base_url}{href}"
-                    self.logger.logger.debug(f"Found CSV file on main page: {filename} at {href}")
+                    # Normalizza URL
+                    normalized_url = normalize_url(href)
+                    self.logger.logger.debug(f"Found CSV file on main page: {filename} at {normalized_url}")
                     files.append({
-                        'url': href,
+                        'url': normalized_url,
                         'filename': filename,
                         'size': None  # Will be filled during download
                     })
@@ -1900,15 +2514,16 @@ class ANACScraper:
                 if i > 0:  # Add delay between resource page requests
                     await asyncio.sleep(random.uniform(2, 5))
                 
-                self.logger.logger.info(f"Checking resource page {i+1}/{len(resource_links)}: {resource_url}")
-                
-                # Ensure URL is absolute
-                if not resource_url.startswith('http'):
-                    resource_url = f"{self.base_url}{resource_url}"
+                normalized_resource_url = normalize_url(resource_url)
+                self.logger.logger.info(f"Checking resource page for CSV {i+1}/{len(resource_links)}: {normalized_resource_url}")
                 
                 try:
                     # Get the resource page
-                    resource_html = await self._make_request(resource_url)
+                    resource_html = await self._make_request(normalized_resource_url)
+                    if not resource_html:
+                        self.logger.logger.error(f"Impossibile recuperare la pagina della risorsa: {normalized_resource_url}")
+                        continue
+                        
                     resource_soup = BeautifulSoup(resource_html, 'html.parser')
                     
                     # Look for CSV files on the resource page
@@ -1916,20 +2531,18 @@ class ANACScraper:
                         r_href = r_link['href']
                         if r_href.lower().endswith('.csv'):
                             filename = r_href.split('/')[-1]
-                            # Ensure URL is absolute
-                            if not r_href.startswith('http'):
-                                r_href = f"{self.base_url}{r_href}"
+                            normalized_url = normalize_url(r_href)
                             
                             # Check if we already found this file
-                            if not any(f['url'] == r_href for f in files):
-                                self.logger.logger.debug(f"Found CSV file on resource page: {filename} at {r_href}")
+                            if not any(f['url'] == normalized_url for f in files):
+                                self.logger.logger.debug(f"Found CSV file on resource page: {filename} at {normalized_url}")
                                 files.append({
-                                    'url': r_href,
+                                    'url': normalized_url,
                                     'filename': filename,
                                     'size': None  # Will be filled during download
                                 })
                 except Exception as e:
-                    self.logger.logger.error(f"Error processing resource page {resource_url}: {str(e)}")
+                    self.logger.logger.error(f"Error processing resource page for CSV {normalized_resource_url}: {str(e)}")
                     # Continue with other resource pages
             
             # Look for direct download URLs that might be embedded in the page
@@ -1938,15 +2551,13 @@ class ANACScraper:
                 href = button.get('href')
                 if href and href.lower().endswith('.csv'):
                     filename = href.split('/')[-1]
-                    # Ensure URL is absolute
-                    if not href.startswith('http'):
-                        href = f"{self.base_url}{href}"
+                    normalized_url = normalize_url(href)
                     
                     # Check if we already found this file
-                    if not any(f['url'] == href for f in files):
-                        self.logger.logger.debug(f"Found CSV file via download button: {filename} at {href}")
+                    if not any(f['url'] == normalized_url for f in files):
+                        self.logger.logger.debug(f"Found CSV file via download button: {filename} at {normalized_url}")
                         files.append({
-                            'url': href,
+                            'url': normalized_url,
                             'filename': filename,
                             'size': None  # Will be filled during download
                         })
@@ -1956,7 +2567,7 @@ class ANACScraper:
             
         except Exception as e:
             self.logger.logger.error(f"Error getting CSV files from {dataset_url}: {str(e)}")
-            raise
+            return []
 
     async def _download_chunk_with_backoff(self, url: str, chunk_file: str, start_byte: int, end_byte: int, 
                                          chunk_num: int, total_chunks: int, filename: str) -> bool:
@@ -2032,6 +2643,122 @@ class ANACScraper:
         bar = '█' * filled + '░' * (width - filled)
         return f"[{bar}]"
 
+    async def process_downloaded_file(self, file_path: str) -> bool:
+        """Processa il file scaricato, estraendo i file ZIP se contengono JSON."""
+        try:
+            filename = os.path.basename(file_path)
+            self.logger.logger.info(f"Elaborazione post-download di {filename}")
+            
+            # Se è un file ZIP, controlla se contiene JSON
+            if filename.lower().endswith('.zip'):
+                # Controllo se lo ZIP contiene file JSON
+                has_json = False
+                json_files = []
+                
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    file_list = zip_ref.namelist()
+                    for f in file_list:
+                        if f.lower().endswith('.json'):
+                            has_json = True
+                            json_files.append(f)
+                
+                if has_json:
+                    # Crea una directory per l'estrazione
+                    extract_dir = file_path.replace('.zip', '')
+                    os.makedirs(extract_dir, exist_ok=True)
+                    
+                    self.logger.logger.info(f"Estrazione di {len(json_files)} file JSON da {filename}")
+                    
+                    # Estrai i file JSON
+                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                        for json_file in json_files:
+                            zip_ref.extract(json_file, extract_dir)
+                    
+                    self.logger.logger.info(f"File JSON estratti in {extract_dir}")
+                    return True
+            
+            return True
+            
+        except Exception as e:
+            self.logger.logger.error(f"Errore nell'elaborazione post-download: {str(e)}")
+            return False
+
+    async def _download_with_aiohttp(self, url: str, output_file: str, file_size: int) -> bool:
+        """Download tramite aiohttp con gestione del progresso."""
+        try:
+            self.logger.logger.info(f"Download con aiohttp: {os.path.basename(output_file)}")
+            
+            # Assicurati che la directory esista
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            
+            # Preparazione per il download
+            if self.session is None:
+                self.session = aiohttp.ClientSession(headers=self.headers, timeout=self.timeout)
+            
+            # Registra l'inizio del download
+            start_time = time.time()
+            filename = os.path.basename(output_file)
+            self.logger.log_download_start(filename, file_size)
+            
+            # Controlla se possiamo riprendere il download
+            mode = 'ab'
+            start_byte = 0
+            if os.path.exists(output_file):
+                start_byte = os.path.getsize(output_file)
+                self.logger.logger.info(f"Riprendo download da {start_byte/(1024*1024):.1f}MB")
+            else:
+                mode = 'wb'
+            
+            # Prepara gli header
+            headers = self.headers.copy()
+            if start_byte > 0:
+                headers['Range'] = f'bytes={start_byte}-'
+            
+            # Effettua la richiesta
+            async with self.session.get(url, headers=headers, timeout=self.timeout) as response:
+                if response.status not in (200, 206):
+                    self.logger.logger.error(f"Errore HTTP: {response.status}")
+                    return False
+                
+                # Avvia il monitoraggio del progresso
+                monitor_task = asyncio.create_task(
+                    self._monitor_download_progress_with_eta(output_file, file_size)
+                )
+                
+                # Scarica a blocchi
+                with open(output_file, mode) as f:
+                    downloaded_size = start_byte
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                
+                # Cancella il task di monitoraggio
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+                
+                # Verifica dimensione finale
+                if os.path.exists(output_file):
+                    actual_size = os.path.getsize(output_file)
+                    if abs(actual_size - file_size) <= 1024:  # Tollera differenza dell'1%
+                        elapsed = time.time() - start_time
+                        self.logger.log_download_complete(filename, elapsed)
+                        return True
+                    else:
+                        self.logger.log_download_error(
+                            filename, 
+                            f"Dimensione non corrispondente: attesa {file_size}, reale {actual_size}"
+                        )
+                
+                return False
+                
+        except Exception as e:
+            self.logger.logger.error(f"Errore nel download con aiohttp: {str(e)}")
+            return False
+
 async def main():
     """Funzione principale per il download completo di tutti i dataset."""
     # Crea le directory per i download
@@ -2039,58 +2766,199 @@ async def main():
     os.makedirs(os.path.join(output_dir, "json"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "csv"), exist_ok=True)
     
+    # File JSON di appoggio per i dataset e i relativi file
+    datasets_cache_file = "datasets_cache.json"
+    
     print("\nAnalizziamo il sito dati.anticorruzione.it per trovare tutti i dataset disponibili...")
     
     try:
         async with ANACScraper() as scraper:
-            # Ottieni la lista completa dei dataset prima di mostrare il menu
-            print("\nRecupero lista completa dei dataset...")
-            dataset_pages = await scraper.get_dataset_pages()
+            cache_data = {}
+            
+            # Controlla se esiste già un file cache
+            if os.path.exists(datasets_cache_file):
+                try:
+                    with open(datasets_cache_file, 'r') as f:
+                        cache_data = json.load(f)
+                    print(f"\nUtilizzo cache esistente con {len(cache_data.get('datasets', {}))} dataset")
+                    
+                    # Validità della cache: se è più vecchia di 7 giorni, la consideriamo scaduta
+                    if 'last_updated' in cache_data:
+                        last_updated = datetime.fromisoformat(cache_data['last_updated'])
+                        days_old = (datetime.now() - last_updated).days
+                        if days_old > 7:
+                            print(f"La cache è vecchia di {days_old} giorni. Aggiornamento in corso...")
+                            cache_data = {}  # Reset della cache
+                except Exception as e:
+                    print(f"Errore nella lettura della cache: {str(e)}. Creazione di una nuova cache.")
+                    cache_data = {}
+            
+            # Se non abbiamo una cache valida, recupera la lista completa dei dataset
+            if not cache_data or 'datasets' not in cache_data:
+                print("\nRecupero lista completa dei dataset...")
+                dataset_pages = await scraper.get_dataset_pages()
+                total_datasets = len(dataset_pages)
+                print(f"\n✓ Trovati {total_datasets} dataset totali")
+                
+                # Inizializza la cache
+                cache_data = {
+                    'last_updated': datetime.now().isoformat(),
+                    'total_datasets': total_datasets,
+                    'datasets': {}
+                }
+                
+                # Mostra progresso
+                print("\nAnalisi dettagli dei dataset...")
+                
+                # Analizziamo tutti i dataset, non solo un campione
+                total_json_files = 0
+                total_csv_files = 0
+                
+                # Counter per file trovati in tempo reale
+                real_json_counter = 0
+                real_csv_counter = 0
+                processed_datasets = 0
+                skipped_datasets = 0
+                error_datasets = 0
+                
+                # Crea una tabella per i contatori in tempo reale
+                from rich.live import Live
+                from rich.table import Table
+                from rich.console import Console
+                
+                console = Console()
+                
+                def generate_stats_table():
+                    table = Table(title="Stato Scansione Dataset")
+                    table.add_column("Metriche", justify="left", style="cyan")
+                    table.add_column("Valore", justify="right", style="green")
+                    
+                    table.add_row("Dataset Processati", f"{processed_datasets}/{total_datasets} ({processed_datasets/total_datasets*100:.1f}%)")
+                    table.add_row("Dataset Saltati", str(skipped_datasets))
+                    table.add_row("Dataset con Errori", str(error_datasets))
+                    table.add_row("File JSON Trovati", str(real_json_counter))
+                    table.add_row("File CSV Trovati", str(real_csv_counter))
+                    table.add_row("Totale File", str(real_json_counter + real_csv_counter))
+                    
+                    if processed_datasets > 0:
+                        table.add_row("Media JSON per Dataset", f"{real_json_counter/processed_datasets:.2f}")
+                    
+                    return table
+                
+                # Processa tutti i dataset con visualizzazione in tempo reale
+                with Live(generate_stats_table(), refresh_per_second=4) as live:
+                    for i, dataset_url in enumerate(dataset_pages):
+                        current_dataset_info = {
+                            'url': dataset_url,
+                            'json_files': [],
+                            'csv_files': [],
+                            'analyzed': False,
+                            'error': None,
+                            'processing_time': 0
+                        }
+                        
+                        # Verifica se questo dataset è già stato analizzato e salvato nella cache
+                        if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url].get('analyzed', False):
+                            processed_datasets += 1
+                            skipped_datasets += 1
+                            real_json_counter += len(cache_data['datasets'][dataset_url].get('json_files', []))
+                            real_csv_counter += len(cache_data['datasets'][dataset_url].get('csv_files', []))
+                            live.update(generate_stats_table())
+                            continue
+                        
+                        start_time = time.time()
+                        
+                        try:
+                            # Recupera i file JSON
+                            json_files = await scraper.get_json_files(dataset_url)
+                            current_dataset_info['json_files'] = json_files
+                            real_json_counter += len(json_files)
+                            
+                            # Recupera i file CSV
+                            csv_files = await scraper.get_csv_files(dataset_url)
+                            current_dataset_info['csv_files'] = csv_files
+                            real_csv_counter += len(csv_files)
+                            
+                            current_dataset_info['analyzed'] = True
+                            processed_datasets += 1
+                            
+                        except Exception as e:
+                            current_dataset_info['error'] = str(e)
+                            error_datasets += 1
+                            processed_datasets += 1
+                            scraper.logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
+                        
+                        # Calcola il tempo di elaborazione
+                        current_dataset_info['processing_time'] = time.time() - start_time
+                        
+                        # Aggiungiamo il dataset alla cache
+                        cache_data['datasets'][dataset_url] = current_dataset_info
+                        
+                        # Aggiorna la visualizzazione
+                        live.update(generate_stats_table())
+                        
+                        # Salviamo periodicamente la cache
+                        if i % 10 == 0 or i == total_datasets - 1:
+                            cache_data['last_updated'] = datetime.now().isoformat()
+                            cache_data['total_json_files'] = real_json_counter
+                            cache_data['total_csv_files'] = real_csv_counter
+                            
+                            with open(datasets_cache_file, 'w') as f:
+                                json.dump(cache_data, f, indent=2)
+                
+                # Salva la cache finale
+                cache_data['last_updated'] = datetime.now().isoformat()
+                cache_data['total_json_files'] = real_json_counter
+                cache_data['total_csv_files'] = real_csv_counter
+                
+                with open(datasets_cache_file, 'w') as f:
+                    json.dump(cache_data, f, indent=2)
+                
+                print("\n✓ Analisi completa terminata e salvata nel file cache")
+                
+                # Rapporto dettagliato
+                print(f"\nRAPPORTO FINALE:")
+                print(f"✓ Dataset analizzati: {processed_datasets}/{total_datasets}")
+                print(f"✓ Dataset saltati (già in cache): {skipped_datasets}")
+                print(f"✓ Dataset con errori: {error_datasets}")
+                print(f"✓ File JSON effettivi trovati: {real_json_counter}")
+                print(f"✓ File CSV effettivi trovati: {real_csv_counter}")
+                print(f"✓ Totale file trovati: {real_json_counter + real_csv_counter}")
+                
+                if processed_datasets > 0:
+                    print(f"✓ Media file JSON per dataset: {real_json_counter/processed_datasets:.2f}")
+                    print(f"✓ Media file CSV per dataset: {real_csv_counter/processed_datasets:.2f}")
+                
+                # Identifica i dataset con più file
+                top_json_datasets = sorted(
+                    [d for d in cache_data['datasets'].values() if d.get('analyzed', False)],
+                    key=lambda x: len(x.get('json_files', [])), 
+                    reverse=True
+                )[:5]
+                
+                if top_json_datasets:
+                    print("\nTop 5 dataset con più file JSON:")
+                    for i, dataset in enumerate(top_json_datasets, 1):
+                        print(f"{i}. {dataset['url']} - {len(dataset.get('json_files', []))} file JSON")
+                
+            # A questo punto abbiamo una cache aggiornata con tutti i dataset
+            dataset_pages = list(cache_data.get('datasets', {}).keys())
             total_datasets = len(dataset_pages)
-            print(f"\n✓ Trovati {total_datasets} dataset totali")
             
-            # Conteggio file per ciascun formato
-            print("\nAnalisi dettagli dei dataset...")
+            # Conteggio file dai dati in cache
+            total_json_files = cache_data.get('total_json_files', 0)
+            if total_json_files == 0:
+                total_json_files = sum(len(dataset_info.get('json_files', [])) for dataset_info in cache_data.get('datasets', {}).values() if dataset_info.get('analyzed', False))
             
-            # Mostra progresso
-            progress_step = max(1, total_datasets // 10)  # Aggiorna il contatore ogni 10%
-            total_json_files = 0
-            total_csv_files = 0
+            total_csv_files = cache_data.get('total_csv_files', 0)
+            if total_csv_files == 0:
+                total_csv_files = sum(len(dataset_info.get('csv_files', [])) for dataset_info in cache_data.get('datasets', {}).values() if dataset_info.get('analyzed', False))
             
-            # Prendiamo solo un campione rappresentativo per essere veloci
-            sample_size = min(5, total_datasets)
-            sample_datasets = random.sample(dataset_pages, sample_size)
-            
-            # Analizza il campione
-            for i, dataset_url in enumerate(sample_datasets):
-                print(f"Analisi dataset {i+1}/{sample_size}: {dataset_url}", end="\r")
-                
-                try:
-                    json_files = await scraper.get_json_files(dataset_url)
-                    total_json_files += len(json_files)
-                except Exception as e:
-                    scraper.logger.logger.error(f"Errore nel campionamento JSON: {str(e)}")
-                
-                try:
-                    csv_files = await scraper.get_csv_files(dataset_url)
-                    total_csv_files += len(csv_files)
-                except Exception as e:
-                    scraper.logger.logger.error(f"Errore nel campionamento CSV: {str(e)}")
-            
-            # Estrapola il totale stimato
-            estimated_json_files = total_json_files * (total_datasets / sample_size)
-            estimated_csv_files = total_csv_files * (total_datasets / sample_size)
-            
-            print("\n")
-            print(f"✓ Stima file JSON disponibili: ~{int(estimated_json_files)}")
-            print(f"✓ Stima file CSV disponibili: ~{int(estimated_csv_files)}")
-            print(f"✓ Totale file stimati: ~{int(estimated_json_files + estimated_csv_files)}")
-    
             # Menu interattivo
             print("\n=== ANAC Dataset Downloader ===")
             print(f"Dataset totali: {total_datasets}")
-            print(f"File JSON stimati: ~{int(estimated_json_files)}")
-            print(f"File CSV stimati: ~{int(estimated_csv_files)}")
+            print(f"File JSON trovati: {total_json_files}")
+            print(f"File CSV trovati: {total_csv_files}")
             print("-------------------------")
             print("1. Scarica file JSON")
             print("2. Scarica file CSV")
@@ -2098,11 +2966,59 @@ async def main():
             print("4. Riprendi download interrotti")
             print("5. Mostra statistiche")
             print("6. Scarica file specifico")
-            print("7. Esci")
+            print("7. Rigenera cache")
+            print("8. Verifica integrità cache")
+            print("9. Esci")
             
-            choice = input("\nScegli un'opzione (1-7): ")
+            choice = input("\nScegli un'opzione (1-9): ")
             
+            if choice == "9":
+                return
+            
+            # Opzione per verificare l'integrità della cache
+            if choice == "8":
+                print("\nVerifica dell'integrità della cache in corso...")
+                
+                total_expected = len(cache_data.get('datasets', {}))
+                analyzed_count = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False))
+                error_count = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('error'))
+                missing_json = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False) and not info.get('json_files'))
+                missing_csv = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False) and not info.get('csv_files'))
+                
+                print(f"Dataset totali nella cache: {total_expected}")
+                print(f"Dataset analizzati: {analyzed_count} ({analyzed_count/total_expected*100:.1f}%)")
+                print(f"Dataset con errori: {error_count} ({error_count/total_expected*100:.1f}%)")
+                print(f"Dataset senza file JSON: {missing_json} ({missing_json/analyzed_count*100:.1f}% degli analizzati)")
+                print(f"Dataset senza file CSV: {missing_csv} ({missing_csv/analyzed_count*100:.1f}% degli analizzati)")
+                
+                # Verifica URL duplicati o mancanti
+                all_json_urls = []
+                for info in cache_data.get('datasets', {}).values():
+                    if not info.get('analyzed', False):
+                        continue
+                    for file_info in info.get('json_files', []):
+                        all_json_urls.append(file_info.get('url'))
+                
+                duplicate_urls = {url: count for url, count in collections.Counter(all_json_urls).items() if count > 1}
+                
+                if duplicate_urls:
+                    print(f"\nTrovati {len(duplicate_urls)} URL duplicati nei file JSON")
+                    for url, count in list(duplicate_urls.items())[:5]:  # Mostra solo i primi 5
+                        print(f"- {url}: trovato {count} volte")
+                    if len(duplicate_urls) > 5:
+                        print(f"...e altri {len(duplicate_urls) - 5} URL duplicati")
+                
+                print("\nVerifica completata")
+                input("\nPremi invio per tornare al menu principale...")
+                return
+                
+            # Opzione per rigenerare la cache
             if choice == "7":
+                print("\nRigenerazione della cache in corso...")
+                # Elimina il file cache esistente
+                if os.path.exists(datasets_cache_file):
+                    os.remove(datasets_cache_file)
+                print("Cache eliminata. Riavvia lo script per generare una nuova cache.")
                 return
                 
             # Opzione per scaricare un file specifico
@@ -2120,10 +3036,16 @@ async def main():
                 print(f"\nRecupero file {file_type.upper()} dal dataset {dataset_url}...")
                 
                 try:
-                    if file_type == "json":
-                        files = await scraper.get_json_files(dataset_url)
+                    # Verifica se il dataset è nella cache
+                    if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url]['analyzed']:
+                        files = cache_data['datasets'][dataset_url][f'{file_type}_files']
+                        print(f"Utilizzando dati dalla cache per {dataset_url}")
                     else:
-                        files = await scraper.get_csv_files(dataset_url)
+                        # Se non è nella cache, recupera i dati direttamente
+                        if file_type == "json":
+                            files = await scraper.get_json_files(dataset_url)
+                        else:
+                            files = await scraper.get_csv_files(dataset_url)
                     
                     if not files:
                         print(f"Nessun file {file_type.upper()} trovato in questo dataset.")
@@ -2193,6 +3115,42 @@ async def main():
                 
                 return
             
+            # Opzione per mostrate statistiche dettagliate
+            if choice == "5":
+                print("\n=== Statistiche Dettagliate ===")
+                print(f"Dataset totali: {total_datasets}")
+                print(f"File JSON totali: {total_json_files}")
+                print(f"File CSV totali: {total_csv_files}")
+                
+                # Dataset con più file JSON
+                json_leader = max(
+                    ((url, len(info['json_files'])) for url, info in cache_data['datasets'].items() if info['analyzed'] and info['json_files']),
+                    key=lambda x: x[1],
+                    default=('Nessuno', 0)
+                )
+                print(f"\nDataset con più file JSON: {json_leader[0]} ({json_leader[1]} file)")
+                
+                # Dataset con più file CSV
+                csv_leader = max(
+                    ((url, len(info['csv_files'])) for url, info in cache_data['datasets'].items() if info['analyzed'] and info['csv_files']),
+                    key=lambda x: x[1],
+                    default=('Nessuno', 0)
+                )
+                print(f"Dataset con più file CSV: {csv_leader[0]} ({csv_leader[1]} file)")
+                
+                # Media file per dataset
+                json_avg = total_json_files / total_datasets if total_datasets > 0 else 0
+                csv_avg = total_csv_files / total_datasets if total_datasets > 0 else 0
+                print(f"\nMedia file JSON per dataset: {json_avg:.2f}")
+                print(f"Media file CSV per dataset: {csv_avg:.2f}")
+                
+                # Statistiche sui dataset con errori
+                error_datasets = sum(1 for info in cache_data['datasets'].values() if info.get('error'))
+                print(f"\nDataset con errori: {error_datasets} ({error_datasets/total_datasets*100:.1f}%)")
+                
+                input("\nPremi invio per tornare al menu principale...")
+                return
+            
             # Riutilizziamo la lista di dataset già recuperata
             if choice in ["1", "2", "3"]:
                 # Statistiche
@@ -2202,11 +3160,14 @@ async def main():
                 for index, dataset_url in enumerate(dataset_pages, 1):
                     print(f"\nProcessando dataset {index}/{total_datasets}: {dataset_url}")
                     
-                    # Gestione file JSON
-                    if choice in ["1", "3"]:
-                        try:
-                            json_files = await scraper.get_json_files(dataset_url)
-                            print(f"Trovati {len(json_files)} file JSON")
+                    # Verifichiamo se abbiamo i dati nella cache
+                    if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url]['analyzed']:
+                        dataset_info = cache_data['datasets'][dataset_url]
+                        
+                        # Gestione file JSON
+                        if choice in ["1", "3"] and dataset_info['json_files']:
+                            json_files = dataset_info['json_files']
+                            print(f"Trovati {len(json_files)} file JSON nella cache")
                             
                             for file_info in json_files:
                                 try:
@@ -2225,16 +3186,12 @@ async def main():
                                 except Exception as e:
                                     failed_downloads += 1
                                     print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                    scraper.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                        except Exception as e:
-                            print(f"✗ Errore nel recupero dei file JSON: {str(e)}")
-                            scraper.logger.error(f"Errore nel recupero dei file JSON da {dataset_url}: {str(e)}")
-                    
-                    # Gestione file CSV
-                    if choice in ["2", "3"]:
-                        try:
-                            csv_files = await scraper.get_csv_files(dataset_url)
-                            print(f"Trovati {len(csv_files)} file CSV")
+                                    scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
+                        
+                        # Gestione file CSV
+                        if choice in ["2", "3"] and dataset_info['csv_files']:
+                            csv_files = dataset_info['csv_files']
+                            print(f"Trovati {len(csv_files)} file CSV nella cache")
                             
                             for file_info in csv_files:
                                 try:
@@ -2253,119 +3210,153 @@ async def main():
                                 except Exception as e:
                                     failed_downloads += 1
                                     print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                    scraper.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                        except Exception as e:
-                            print(f"✗ Errore nel recupero dei file CSV: {str(e)}")
-                            scraper.logger.error(f"Errore nel recupero dei file CSV da {dataset_url}: {str(e)}")
-            
-            # Riprendi download interrotti
-            elif choice == "4":
-                print("\nFile falliti in precedenza:")
-                for i, filename in enumerate(scraper.download_state['failed_files'], 1):
-                    print(f"{i}. {filename}")
-                
-                print("\nDownload parziali:")
-                for i, (filename, info) in enumerate(scraper.download_state['partial_downloads'].items(), len(scraper.download_state['failed_files']) + 1):
-                    progress = (info['downloaded_bytes'] / info['total_bytes']) * 100
-                    print(f"{i}. {filename} ({progress:.1f}%)")
-                
-                retry_choice = input("\nScegli il numero del file da riprovare (0 per tutti): ")
-                if retry_choice == "0":
-                    # Riprendi tutti i file falliti
-                    for filename in scraper.download_state['failed_files']:
-                        try:
-                            file_type = "json" if filename.endswith(('.json', '.zip')) else "csv"
-                            success = await scraper.download_file(
-                                filename,  # URL will be reconstructed
-                                filename,
-                                output_dir,
-                                file_type
-                            )
-                            if success:
-                                successful_downloads += 1
-                                print(f"✓ Download completato: {filename}")
-                            else:
-                                failed_downloads += 1
-                                print(f"✗ Download fallito: {filename}")
-                        except Exception as e:
-                            failed_downloads += 1
-                            print(f"✗ Errore durante il download di {filename}: {str(e)}")
-                            scraper.logger.error(f"Errore nel download di {filename}: {str(e)}")
-                    
-                    # Riprendi tutti i download parziali
-                    for filename, info in scraper.download_state['partial_downloads'].items():
-                        try:
-                            file_type = "json" if filename.endswith(('.json', '.zip')) else "csv"
-                            success = await scraper.download_file(
-                                filename,  # URL will be reconstructed
-                                filename,
-                                output_dir,
-                                file_type
-                            )
-                            if success:
-                                successful_downloads += 1
-                                print(f"✓ Download completato: {filename}")
-                            else:
-                                failed_downloads += 1
-                                print(f"✗ Download fallito: {filename}")
-                        except Exception as e:
-                            failed_downloads += 1
-                            print(f"✗ Errore durante il download di {filename}: {str(e)}")
-                            scraper.logger.error(f"Errore nel download di {filename}: {str(e)}")
+                                    scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
                     else:
-                        try:
-                            idx = int(retry_choice) - 1
-                            if idx < len(scraper.download_state['failed_files']):
-                                filename = scraper.download_state['failed_files'][idx]
-                            else:
-                                idx -= len(scraper.download_state['failed_files'])
-                                filename = list(scraper.download_state['partial_downloads'].keys())[idx]
+                        # Se non abbiamo i dati nella cache, li recuperiamo al momento
+                        print(f"Dataset non presente nella cache, recupero dati in tempo reale...")
+                        
+                        # Gestione file JSON
+                        if choice in ["1", "3"]:
+                            try:
+                                json_files = await scraper.get_json_files(dataset_url)
+                                print(f"Trovati {len(json_files)} file JSON")
+                                
+                                for file_info in json_files:
+                                    try:
+                                        file_size = await scraper.get_file_size(file_info['url'])
+                                        success = await scraper.download_file(
+                                            file_info['url'],
+                                            os.path.join(output_dir, "json", file_info['filename']),
+                                            file_size
+                                        )
+                                        if success:
+                                            successful_downloads += 1
+                                            print(f"✓ Download completato: {file_info['filename']}")
+                                        else:
+                                            failed_downloads += 1
+                                            print(f"✗ Download fallito: {file_info['filename']}")
+                                    except Exception as e:
+                                        failed_downloads += 1
+                                        print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
+                                        scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
+                            except Exception as e:
+                                print(f"✗ Errore nel recupero dei file JSON: {str(e)}")
+                                scraper.logger.logger.error(f"Errore nel recupero dei file JSON da {dataset_url}: {str(e)}")
+                        
+                        # Gestione file CSV
+                        if choice in ["2", "3"]:
+                            try:
+                                csv_files = await scraper.get_csv_files(dataset_url)
+                                print(f"Trovati {len(csv_files)} file CSV")
+                                
+                                for file_info in csv_files:
+                                    try:
+                                        file_size = await scraper.get_file_size(file_info['url'])
+                                        success = await scraper.download_file(
+                                            file_info['url'],
+                                            os.path.join(output_dir, "csv", file_info['filename']),
+                                            file_size
+                                        )
+                                        if success:
+                                            successful_downloads += 1
+                                            print(f"✓ Download completato: {file_info['filename']}")
+                                        else:
+                                            failed_downloads += 1
+                                            print(f"✗ Download fallito: {file_info['filename']}")
+                                    except Exception as e:
+                                        failed_downloads += 1
+                                        print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
+                                        scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
+                            except Exception as e:
+                                print(f"✗ Errore nel recupero dei file CSV: {str(e)}")
+                                scraper.logger.logger.error(f"Errore nel recupero dei file CSV da {dataset_url}: {str(e)}")
+                
+                print("\n=== Riepilogo ===")
+                print(f"Download completati: {successful_downloads}")
+                print(f"Download falliti: {failed_downloads}")
+                print(f"Totale: {successful_downloads + failed_downloads}")
+                return
+            
+            if choice == "1":
+                # Scarica tutti i file JSON
+                print("\nScaricamento file JSON in corso...")
+                download_dir = os.path.join(output_dir, "json")
+                total_json_to_download = total_json_files
+                json_downloaded = 0
+                json_skipped = 0
+                json_errors = 0
+                
+                # Crea una tabella per lo stato del download
+                def generate_download_table():
+                    table = Table(title="Stato Download File JSON")
+                    table.add_column("Metriche", justify="left", style="cyan")
+                    table.add_column("Valore", justify="right", style="green")
+                    
+                    table.add_row("File Scaricati", f"{json_downloaded}/{total_json_to_download} ({json_downloaded/total_json_to_download*100:.1f}% completato)")
+                    table.add_row("File Saltati (già esistenti)", str(json_skipped))
+                    table.add_row("Errori", str(json_errors))
+                    table.add_row("File Rimanenti", str(total_json_to_download - json_downloaded - json_skipped))
+                    
+                    if json_downloaded > 0:
+                        progress = json_downloaded / total_json_to_download
+                        table.add_row("Barra Progresso", f"[{'=' * int(progress * 40)}{' ' * (40 - int(progress * 40))}] {progress*100:.1f}%")
+                    
+                    return table
+                
+                # Processa tutti i dataset con visualizzazione in tempo reale
+                with Live(generate_download_table(), refresh_per_second=2) as live:
+                    # Iteriamo su tutti i dataset nella cache
+                    for dataset_url, dataset_info in cache_data['datasets'].items():
+                        if not dataset_info.get('analyzed', False):
+                            continue
+                        
+                        # Estrai i file JSON da questo dataset
+                        for file_info in dataset_info.get('json_files', []):
+                            file_url = file_info.get('url', '')
+                            if not file_url:
+                                continue
                             
-                            file_type = "json" if filename.endswith(('.json', '.zip')) else "csv"
-                            success = await scraper.download_file(
-                                filename,  # URL will be reconstructed
-                                filename,
-                                output_dir,
-                                file_type
-                            )
-                            if success:
-                                successful_downloads += 1
-                                print(f"✓ Download completato: {filename}")
-                            else:
-                                failed_downloads += 1
-                                print(f"✗ Download fallito: {filename}")
-                        except (ValueError, IndexError):
-                            print("Scelta non valida")
+                            # Genera un nome file basato sull'URL
+                            filename = os.path.basename(file_url)
+                            if not filename:
+                                # Se il nome file non può essere estratto, usa l'hash dell'URL
+                                filename = f"file_{hashlib.md5(file_url.encode()).hexdigest()}.json"
+                                
+                            # Se l'URL non termina con .json o .zip, aggiungi l'estensione
+                            if not (filename.lower().endswith('.json') or filename.lower().endswith('.zip')):
+                                filename += '.json'
+                                
+                            output_path = os.path.join(download_dir, filename)
+                            
+                            # Verifica se il file esiste già
+                            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                                json_skipped += 1
+                                live.update(generate_download_table())
+                                continue
+                                
+                            try:
+                                # Ottieni la dimensione del file
+                                file_size = await scraper.get_file_size(file_url)
+                                
+                                # Scarica il file
+                                success = await scraper.download_file(file_url, output_path, file_size)
+                                
+                                if success:
+                                    # Processa il file scaricato (estrai se è uno ZIP)
+                                    await scraper.process_downloaded_file(output_path)
+                                    json_downloaded += 1
+                                else:
+                                    json_errors += 1
+                                    
+                            except Exception as e:
+                                json_errors += 1
+                                scraper.logger.logger.error(f"Errore nel download del file {file_url}: {str(e)}")
+                                
+                            # Aggiorna la visualizzazione
+                            live.update(generate_download_table())
                 
-                # Mostra statistiche
-                elif choice == "5":
-                    print("\n=== Statistiche Download ===")
-                    print(f"File completati: {len(scraper.download_state['completed_files'])}")
-                    print(f"File falliti: {len(scraper.download_state['failed_files'])}")
-                    print(f"Download parziali: {len(scraper.download_state['partial_downloads'])}")
-                    print(f"Ultimo aggiornamento: {scraper.download_state['last_update']}")
-                    
-                    if scraper.download_state['partial_downloads']:
-                        print("\nDownload parziali:")
-                        for filename, info in scraper.download_state['partial_downloads'].items():
-                            progress = (info['downloaded_bytes'] / info['total_bytes']) * 100
-                            print(f"- {filename}: {progress:.1f}%")
-                    
-                    print("\nFile falliti:")
-                    for filename in scraper.download_state['failed_files']:
-                        print(f"- {filename}")
-                
-                # Stampa statistiche finali
-                if choice in ["1", "2", "3"]:
-                    print("\n=== Statistiche Finali ===")
-                    print(f"Dataset processati: {total_datasets}")
-                    print(f"File JSON trovati: {total_json_files}")
-                    print(f"File CSV trovati: {total_csv_files}")
-                    print(f"Download completati con successo: {successful_downloads}")
-                    print(f"Download falliti: {failed_downloads}")
-                    if successful_downloads + failed_downloads > 0:
-                        print(f"Percentuale di successo: {(successful_downloads/(successful_downloads+failed_downloads)*100):.2f}%")
-                    print("\nControlla il file 'download_problems.log' per i dettagli dei download falliti")
+                print(f"\n✓ Download completato: {json_downloaded} file scaricati, {json_skipped} saltati, {json_errors} errori")
+                return
     
     except KeyboardInterrupt:
         print("\n\nOperazione interrotta dall'utente. I download parziali verranno salvati e potranno essere ripresi in seguito.")
