@@ -1512,8 +1512,22 @@ class ANACScraper:
         json_files = []
         
         try:
+            # Prepara headers migliori per evitare il blocco anti-scraping
+            custom_headers = self.headers.copy()
+            custom_headers['Referer'] = 'https://dati.anticorruzione.it/opendata/dataset'
+            custom_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+            custom_headers['Accept-Language'] = 'it-IT,it;q=0.8,en-US;q=0.5,en;q=0.3'
+            
             # Ottieni il contenuto della pagina
+            self.logger.logger.info(f"Accesso alla pagina dataset: {dataset_url}")
             html_content = await self._make_request(dataset_url)
+            if not html_content:
+                self.logger.logger.error(f"Nessun contenuto ricevuto dalla pagina {dataset_url}")
+                return []
+                
+            # Pausa per evitare di sovraccaricare il server
+            await asyncio.sleep(2)
+            
             soup = BeautifulSoup(html_content, 'html.parser')
             
             # Funzione per normalizzare gli URL
@@ -1527,67 +1541,137 @@ class ANACScraper:
                 # Se è relativo, aggiungi il percorso base
                 return f"{self.base_url}/{url}"
             
-            # Cerca link diretti a file JSON o ZIP
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if self._is_json_or_zip_file(href):
-                    absolute_url = normalize_url(href)
-                    filename = os.path.basename(absolute_url)
+            # Cerca specificamente i link alle risorse (il focus è qui!)
+            resource_links = soup.select('li.resource-item a.resource-url-analytics, a.btn-primary')
+            self.logger.logger.info(f"Trovati {len(resource_links)} link a risorse principali")
+            
+            # Se non troviamo risorse con i selettori specifici, proviamo un approccio più ampio
+            if not resource_links:
+                resource_links = soup.select('a[href*="/resource/"]')
+                self.logger.logger.info(f"Secondo tentativo: trovati {len(resource_links)} link a risorse")
+            
+            # Analizza ogni risorsa trovata
+            for resource_link in resource_links:
+                href = resource_link.get('href', '')
+                if not href:
+                    continue
+                    
+                # Verifica se è un link a una pagina di risorse
+                if '/resource/' in href and not href.lower().endswith(('.json', '.zip')):
+                    resource_url = normalize_url(href)
+                    self.logger.logger.info(f"Accesso alla pagina risorsa: {resource_url}")
+                    
+                    try:
+                        # Aggiungi un delay prima di ogni richiesta
+                        await asyncio.sleep(3)
+                        
+                        # Accedi alla pagina della risorsa
+                        resource_content = await self._make_request(resource_url)
+                        resource_soup = BeautifulSoup(resource_content, 'html.parser')
+                        
+                        # Cerca il link di download diretto nella pagina della risorsa
+                        download_links = resource_soup.select('a.resource-url-analytics, a.btn-primary, p.muted a[href$=".json"], p.muted a[href$=".zip"]')
+                        
+                        for download_link in download_links:
+                            download_href = download_link.get('href', '')
+                            if download_href and (download_href.lower().endswith('.json') or download_href.lower().endswith('.zip')):
+                                # Questo è un link diretto al file
+                                file_url = normalize_url(download_href)
+                                filename = os.path.basename(file_url)
+                                
+                                self.logger.logger.info(f"Trovato link download: {file_url}")
+                                
+                                # Ottieni la dimensione del file
+                                try:
+                                    # Aggiungi un delay prima di verificare la dimensione
+                                    await asyncio.sleep(2)
+                                    file_size = await self.get_file_size(file_url)
+                                    self.logger.log_file_info(filename, file_url, file_size, "JSON", resource_url)
+                                except Exception as e:
+                                    self.logger.logger.error(f"Errore nel recupero della dimensione del file {filename}: {str(e)}")
+                                    file_size = 1  # Imposta un valore positivo anche se non riusciamo a determinare la dimensione
+                                
+                                json_files.append({
+                                    'url': file_url,
+                                    'filename': filename,
+                                    'size': file_size,
+                                    'dataset': os.path.basename(dataset_url)
+                                })
+                    except Exception as e:
+                        self.logger.logger.error(f"Errore nell'accesso alla pagina risorsa {resource_url}: {str(e)}")
+                
+                # Controllo per link diretti a file
+                elif href.lower().endswith(('.json', '.zip')):
+                    file_url = normalize_url(href)
+                    filename = os.path.basename(file_url)
+                    
+                    self.logger.logger.info(f"Trovato link diretto a file: {file_url}")
                     
                     # Ottieni la dimensione del file
                     try:
-                        file_size = await self.get_file_size(absolute_url)
-                        self.logger.log_file_info(filename, absolute_url, file_size, "JSON", dataset_url)
+                        await asyncio.sleep(2)
+                        file_size = await self.get_file_size(file_url)
+                        self.logger.log_file_info(filename, file_url, file_size, "JSON", dataset_url)
                     except Exception as e:
                         self.logger.logger.error(f"Errore nel recupero della dimensione del file {filename}: {str(e)}")
-                        file_size = 0
+                        file_size = 1  # Imposta un valore positivo anche se non riusciamo a determinare la dimensione
                     
                     json_files.append({
-                        'url': absolute_url,
+                        'url': file_url,
                         'filename': filename,
-                        'size': file_size
+                        'size': file_size,
+                        'dataset': os.path.basename(dataset_url)
                     })
             
-            # Cerca in pagine di risorse
-            resource_links = soup.find_all('a', href=lambda x: x and 'resource' in x.lower())
-            for resource_link in resource_links:
-                resource_url = normalize_url(resource_link['href'])
-                try:
-                    resource_content = await self._make_request(resource_url)
-                    resource_soup = BeautifulSoup(resource_content, 'html.parser')
-                    
-                    # Cerca link di download nella pagina della risorsa
-                    for download_link in resource_soup.find_all('a', href=True):
-                        href = download_link['href']
-                        if self._is_json_or_zip_file(href):
-                            absolute_url = normalize_url(href)
-                            filename = os.path.basename(absolute_url)
-                            
-                            # Ottieni la dimensione del file
-                            try:
-                                file_size = await self.get_file_size(absolute_url)
-                                self.logger.log_file_info(filename, absolute_url, file_size, "JSON", dataset_url)
-                            except Exception as e:
-                                self.logger.logger.error(f"Errore nel recupero della dimensione del file {filename}: {str(e)}")
-                                file_size = 0
-                            
-                            json_files.append({
-                                'url': absolute_url,
-                                'filename': filename,
-                                'size': file_size
-                            })
-                except Exception as e:
-                    self.logger.logger.error(f"Errore nel recupero della pagina risorsa {resource_url}: {str(e)}")
+            # Se non abbiamo trovato file, prova a cercare link diretti nella pagina
+            if not json_files:
+                self.logger.logger.info("Tentativo finale: cercando link diretti a file JSON/ZIP nella pagina")
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if href.lower().endswith(('.json', '.zip')) and self._is_json_or_zip_file(href):
+                        file_url = normalize_url(href)
+                        filename = os.path.basename(file_url)
+                        
+                        self.logger.logger.info(f"Trovato link diretto: {file_url}")
+                        
+                        try:
+                            await asyncio.sleep(2)
+                            file_size = await self.get_file_size(file_url)
+                            self.logger.log_file_info(filename, file_url, file_size, "JSON", dataset_url)
+                        except Exception as e:
+                            self.logger.logger.error(f"Errore nel recupero della dimensione del file {filename}: {str(e)}")
+                            file_size = 1
+                        
+                        json_files.append({
+                            'url': file_url,
+                            'filename': filename,
+                            'size': file_size,
+                            'dataset': os.path.basename(dataset_url)
+                        })
             
             # Rimuovi duplicati mantenendo il primo URL per ogni nome file
             seen_filenames = set()
             unique_json_files = []
             for file_info in json_files:
-                if file_info['filename'] not in seen_filenames:
-                    seen_filenames.add(file_info['filename'])
-                    unique_json_files.append(file_info)
+                filename = file_info['filename']
+                # Verifica ulteriore che non sia un file invalido
+                if (filename and 
+                    not any(pattern in filename.lower() for pattern in ['#', 'mailto', 'accessibilit']) and
+                    (filename.lower().endswith('.json') or filename.lower().endswith('.zip'))):
+                    
+                    if filename not in seen_filenames:
+                        seen_filenames.add(filename)
+                        unique_json_files.append(file_info)
             
-            self.logger.logger.info(f"Trovati {len(unique_json_files)} file JSON unici")
+            self.logger.logger.info(f"Trovati {len(unique_json_files)} file JSON/ZIP unici")
+            
+            # Aggiungi dettagli sui file trovati per debug
+            if unique_json_files:
+                for file_info in unique_json_files:
+                    self.logger.logger.info(f"File trovato: {file_info['filename']} ({self._format_size(file_info['size'])})")
+            else:
+                self.logger.logger.warning(f"Nessun file trovato in {dataset_url}")
+                
             return unique_json_files
             
         except Exception as e:
@@ -1681,6 +1765,120 @@ class ANACScraper:
         except Exception as e:
             self.logger.logger.error(f"Errore nel recupero dei file CSV da {dataset_url}: {str(e)}")
             return []
+
+    def _is_json_or_zip_file(self, href):
+        """Verifica se l'URL è un file JSON o ZIP valido."""
+        # Ignora link con parametri query o frammenti che spesso sono link di navigazione
+        if not href or '?' in href or '#' in href or 'mailto:' in href:
+            return False
+            
+        href_lower = href.lower()
+        
+        # Verifica se termina con estensioni valide
+        is_valid_extension = href_lower.endswith('.json') or href_lower.endswith('.zip')
+        
+        # Verifica che non sia un link di navigazione o una pagina
+        invalid_patterns = [
+            'home', 'index', 'dataset', 'opendata', 'privacy', 'note-legali', 
+            'copyright', 'accessibilit', 'cookies', 'content', 'organization',
+            'regpia', 'aca', 'rpct', 'l190', 'anticorruzione', 'mailto'
+        ]
+        
+        for pattern in invalid_patterns:
+            if pattern in href_lower:
+                return False
+                
+        # Ulteriore verifica che sia un nome file valido
+        basename = os.path.basename(href)
+        
+        # Deve avere un nome file non vuoto e estensione valida
+        return basename and is_valid_extension and len(basename) > 5 and not basename.startswith('#')
+
+    async def process_downloaded_file(self, file_path):
+        """Processa un file scaricato.
+        
+        In precedenza questo metodo estraeva i file ZIP, ora li mantiene così come sono.
+        """
+        # Non fare nulla, mantieni i file compressi
+        return
+
+    async def get_dataset_pages(self) -> List[str]:
+        """Recupera tutte le pagine dataset dal sito ANAC."""
+        self.logger.logger.info("Recupero di tutti i dataset...")
+        
+        # Pagina principale dei dataset
+        base_dataset_url = f"{self.base_url}/opendata/dataset"
+        self.logger.logger.info(f"Accesso alla pagina principale: {base_dataset_url}")
+        
+        dataset_pages = []
+        page_num = 1
+        
+        while True:
+            # Costruisci l'URL della pagina corrente
+            if page_num == 1:
+                page_url = base_dataset_url
+            else:
+                page_url = f"{base_dataset_url}?page={page_num}"
+                
+            self.logger.logger.info(f"Recupero pagina {page_num}: {page_url}")
+            
+            # Applica rate limiting
+            await self.rate_limiter.acquire()
+            
+            # Ottieni il contenuto HTML
+            html_content = await self._make_request(page_url)
+            if not html_content:
+                self.logger.logger.warning(f"Nessun contenuto ricevuto dalla pagina {page_num}. Interruzione.")
+                break
+                
+            # Analizza il contenuto con BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Cerca specificamente i dataset validi (elementi con classe dataset-item)
+            dataset_items = soup.find_all('li', class_='dataset-item')
+            
+            # Se non ci sono dataset in questa pagina, probabilmente abbiamo finito
+            if not dataset_items:
+                self.logger.logger.info(f"Nessun dataset trovato nella pagina {page_num}. Interruzione.")
+                break
+                
+            # Estrai gli URL dei dataset da ogni elemento dataset-item
+            dataset_count = 0
+            for item in dataset_items:
+                # Trova il link al dataset nella sezione heading
+                dataset_link = item.select_one('h3.dataset-heading a')
+                if dataset_link and dataset_link.has_attr('href'):
+                    href = dataset_link['href']
+                    # Assicurati che sia un URL di dataset valido
+                    if href and '/dataset/' in href:
+                        # Normalizza l'URL
+                        if not href.startswith('http'):
+                            if href.startswith('/'):
+                                href = f"{self.base_url}{href}"
+                            else:
+                                href = f"{self.base_url}/{href}"
+                        
+                        # Aggiungi all'elenco se non è già presente
+                        if href not in dataset_pages:
+                            dataset_pages.append(href)
+                            dataset_count += 1
+            
+            self.logger.logger.info(f"Trovati {dataset_count} dataset validi nella pagina {page_num}")
+            
+            # Verifica se esiste una pagina successiva
+            next_page = soup.find('a', href=lambda href: href and f'?page={page_num+1}' in href)
+            if not next_page:
+                self.logger.logger.info(f"Nessuna pagina successiva trovata dopo la pagina {page_num}. Interruzione.")
+                break
+                
+            # Passa alla pagina successiva
+            page_num += 1
+            
+            # Breve pausa tra le pagine
+            await asyncio.sleep(2)
+            
+        self.logger.logger.info(f"Recupero completato. Trovati {len(dataset_pages)} dataset totali.")
+        return dataset_pages
 
 async def main():
     """Funzione principale per il download completo di tutti i dataset."""
