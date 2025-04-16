@@ -24,6 +24,16 @@ import zipfile
 import collections
 from rich.live import Live
 
+# Rileva se siamo in un ambiente con terminale limitato
+SIMPLE_TERMINAL = 'TMUX' in os.environ or 'SSH_CONNECTION' in os.environ or not sys.stdout.isatty()
+
+# Configurazione console Rich adattiva
+if SIMPLE_TERMINAL:
+    console = Console(highlight=False, color_system="standard", width=100)
+    print("Rilevato ambiente terminale limitato (tmux/ssh). Utilizzo modalità di visualizzazione semplificata.")
+else:
+    console = Console()
+
 class RateLimiter:
     def __init__(self, calls_per_second=1):
         self.calls_per_second = calls_per_second
@@ -41,20 +51,34 @@ class RateLimiter:
 
 class AdvancedLogger:
     def __init__(self, log_file: str = "anac_downloader.log"):
-        self.console = Console()
+        # Usa la console globale che si adatta all'ambiente
+        self.console = console
         self.log_file = log_file
         self.detailed_log_file = "anac_downloader_detailed.log"
         
         # Configura il logging con Rich
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(message)s",
-            datefmt="[%X]",
-            handlers=[
-                RichHandler(rich_tracebacks=True, markup=True),
-                logging.FileHandler(log_file, encoding='utf-8')
-            ]
-        )
+        if SIMPLE_TERMINAL:
+            # Configurazione più semplice per terminali limitati
+            logging.basicConfig(
+                level=logging.INFO,
+                format="[%(levelname)s] %(asctime)s - %(message)s",
+                datefmt="[%X]",
+                handlers=[
+                    logging.StreamHandler(),
+                    logging.FileHandler(log_file, encoding='utf-8')
+                ]
+            )
+        else:
+            # Configurazione completa per terminali moderni
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(message)s",
+                datefmt="[%X]",
+                handlers=[
+                    RichHandler(rich_tracebacks=True, markup=True),
+                    logging.FileHandler(log_file, encoding='utf-8')
+                ]
+            )
         
         self.logger = logging.getLogger("anac_downloader")
         
@@ -1434,6 +1458,16 @@ class ANACScraper:
     async def download_file(self, url: str, output_file: str, file_size: int) -> bool:
         """Download a file with progress tracking and retry logic."""
         try:
+            # Verifica se il file esiste già con la dimensione corretta
+            if os.path.exists(output_file):
+                current_size = os.path.getsize(output_file)
+                # Se la dimensione è simile a quella attesa, considera il file già scaricato
+                if abs(current_size - file_size) <= 1024 or (current_size > 0 and file_size == 0):
+                    self.logger.logger.info(f"File {os.path.basename(output_file)} esiste già con dimensione corretta. Download saltato.")
+                    return True
+                else:
+                    self.logger.logger.info(f"File {os.path.basename(output_file)} esiste ma dimensione diversa (attuale: {current_size}, attesa: {file_size}). Ridownload.")
+            
             # Assicurati che la directory esista
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
@@ -1945,9 +1979,6 @@ async def main():
                 # Crea una tabella per i contatori in tempo reale
                 from rich.live import Live
                 from rich.table import Table
-                from rich.console import Console
-                
-                console = Console()
                 
                 def generate_stats_table():
                     table = Table(title="Stato Scansione Dataset")
@@ -1966,8 +1997,9 @@ async def main():
                     
                     return table
                 
-                # Processa tutti i dataset con visualizzazione in tempo reale
-                with Live(generate_stats_table(), refresh_per_second=4) as live:
+                # Se siamo in un terminale limitato, usa l'output semplice
+                if SIMPLE_TERMINAL:
+                    # Processa tutti i dataset con output semplice
                     for i, dataset_url in enumerate(dataset_pages):
                         current_dataset_info = {
                             'url': dataset_url,
@@ -1984,7 +2016,7 @@ async def main():
                             skipped_datasets += 1
                             real_json_counter += len(cache_data['datasets'][dataset_url].get('json_files', []))
                             real_csv_counter += len(cache_data['datasets'][dataset_url].get('csv_files', []))
-                            live.update(generate_stats_table())
+                            print(f"Dataset {processed_datasets}/{total_datasets} ({dataset_url}): saltato (già in cache)")
                             continue
                         
                         start_time = time.time()
@@ -2002,21 +2034,23 @@ async def main():
                             
                             current_dataset_info['analyzed'] = True
                             processed_datasets += 1
+                            processing_time = time.time() - start_time
+                            
+                            print(f"Dataset {processed_datasets}/{total_datasets} ({processed_datasets/total_datasets*100:.1f}%): "
+                                  f"{len(json_files)} JSON, {len(csv_files)} CSV - {processing_time:.1f}s")
                             
                         except Exception as e:
                             current_dataset_info['error'] = str(e)
                             error_datasets += 1
                             processed_datasets += 1
                             scraper.logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
+                            print(f"Dataset {processed_datasets}/{total_datasets}: ERRORE - {str(e)}")
                         
                         # Calcola il tempo di elaborazione
                         current_dataset_info['processing_time'] = time.time() - start_time
                         
                         # Aggiungiamo il dataset alla cache
                         cache_data['datasets'][dataset_url] = current_dataset_info
-                        
-                        # Aggiorna la visualizzazione
-                        live.update(generate_stats_table())
                         
                         # Salviamo periodicamente la cache
                         if i % 10 == 0 or i == total_datasets - 1:
@@ -2026,6 +2060,67 @@ async def main():
                             
                             with open(datasets_cache_file, 'w') as f:
                                 json.dump(cache_data, f, indent=2)
+                else:
+                    # Processa tutti i dataset con visualizzazione in tempo reale
+                    with Live(generate_stats_table(), refresh_per_second=4) as live:
+                        for i, dataset_url in enumerate(dataset_pages):
+                            current_dataset_info = {
+                                'url': dataset_url,
+                                'json_files': [],
+                                'csv_files': [],
+                                'analyzed': False,
+                                'error': None,
+                                'processing_time': 0
+                            }
+                            
+                            # Verifica se questo dataset è già stato analizzato e salvato nella cache
+                            if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url].get('analyzed', False):
+                                processed_datasets += 1
+                                skipped_datasets += 1
+                                real_json_counter += len(cache_data['datasets'][dataset_url].get('json_files', []))
+                                real_csv_counter += len(cache_data['datasets'][dataset_url].get('csv_files', []))
+                                live.update(generate_stats_table())
+                                continue
+                            
+                            start_time = time.time()
+                            
+                            try:
+                                # Recupera i file JSON
+                                json_files = await scraper.get_json_files(dataset_url)
+                                current_dataset_info['json_files'] = json_files
+                                real_json_counter += len(json_files)
+                                
+                                # Recupera i file CSV
+                                csv_files = await scraper.get_csv_files(dataset_url)
+                                current_dataset_info['csv_files'] = csv_files
+                                real_csv_counter += len(csv_files)
+                                
+                                current_dataset_info['analyzed'] = True
+                                processed_datasets += 1
+                                
+                            except Exception as e:
+                                current_dataset_info['error'] = str(e)
+                                error_datasets += 1
+                                processed_datasets += 1
+                                scraper.logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
+                            
+                            # Calcola il tempo di elaborazione
+                            current_dataset_info['processing_time'] = time.time() - start_time
+                            
+                            # Aggiungiamo il dataset alla cache
+                            cache_data['datasets'][dataset_url] = current_dataset_info
+                            
+                            # Aggiorna la visualizzazione
+                            live.update(generate_stats_table())
+                            
+                            # Salviamo periodicamente la cache
+                            if i % 10 == 0 or i == total_datasets - 1:
+                                cache_data['last_updated'] = datetime.now().isoformat()
+                                cache_data['total_json_files'] = real_json_counter
+                                cache_data['total_csv_files'] = real_csv_counter
+                                
+                                with open(datasets_cache_file, 'w') as f:
+                                    json.dump(cache_data, f, indent=2)
                 
                 # Salva la cache finale
                 cache_data['last_updated'] = datetime.now().isoformat()
