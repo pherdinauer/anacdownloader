@@ -15,24 +15,183 @@ import subprocess
 import sys
 import platform
 import random
+import traceback
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich.logging import RichHandler
 from rich.table import Table
-from rich.panel import Panel
-import zipfile
-import collections
-from rich.live import Live
 
-# Rileva se siamo in un ambiente con terminale limitato
-SIMPLE_TERMINAL = 'TMUX' in os.environ or 'SSH_CONNECTION' in os.environ or not sys.stdout.isatty()
+# Configurazione del logging
+def setup_logging():
+    # Crea la directory logs se non esiste
+    os.makedirs("logs", exist_ok=True)
+    
+    # Nome del file di log con timestamp
+    log_filename = f"logs/anac_downloader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    # Configura il logger principale
+    logger = logging.getLogger("anac_downloader")
+    logger.setLevel(logging.DEBUG)
+    
+    # Handler per il file di log
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s\n%(pathname)s:%(lineno)d\n%(funcName)s\n',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Handler per la console con Rich
+    console_handler = RichHandler(rich_tracebacks=True)
+    console_handler.setLevel(logging.INFO)
+    logger.addHandler(console_handler)
+    
+    return logger
 
-# Configurazione console Rich adattiva
-if SIMPLE_TERMINAL:
-    console = Console(highlight=False, color_system="standard", width=100)
-    print("Rilevato ambiente terminale limitato (tmux/ssh). Utilizzo modalità di visualizzazione semplificata.")
-else:
-    console = Console()
+# Logger globale
+logger = setup_logging()
+
+class AdvancedLogger:
+    def __init__(self, log_file: str = "anac_downloader.log"):
+        self.logger = logger
+        self.detailed_log_file = "logs/download_details.log"
+        self.error_log_file = "logs/errors.log"
+        
+        # Crea i file di log se non esistono
+        os.makedirs("logs", exist_ok=True)
+        if not os.path.exists(self.detailed_log_file):
+            with open(self.detailed_log_file, 'w') as f:
+                f.write("Timestamp,Operation,File,URL,Size,Status,Duration,Speed,Notes\n")
+        if not os.path.exists(self.error_log_file):
+            with open(self.error_log_file, 'w') as f:
+                f.write("Timestamp,Error,File,URL,Stack Trace\n")
+    
+    def _log_to_detailed_file(self, operation, filename, url="", size=0, status="", duration=0, speed=0, notes=""):
+        """Log dettagliato delle operazioni di download"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(self.detailed_log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp},{operation},{filename},{url},{size},{status},{duration:.2f},{speed:.2f},{notes}\n")
+    
+    def _log_error(self, error, filename="", url="", stack_trace=""):
+        """Log dettagliato degli errori"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(self.error_log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp},{error},{filename},{url},{stack_trace}\n")
+    
+    def log_download_start(self, filename: str, size: int, url: str = "", dataset_name: str = "", file_number: int = 0, total_files: int = 0):
+        """Log dell'inizio di un download"""
+        self.logger.info(f"Starting download: {filename} ({size/1024/1024:.1f} MB)")
+        self._log_to_detailed_file(
+            "START",
+            filename,
+            url,
+            size,
+            "STARTED",
+            0,
+            0,
+            f"Dataset: {dataset_name}, File {file_number}/{total_files}"
+        )
+    
+    def log_download_progress(self, filename: str, current: int, total: int, speed: float, elapsed: float):
+        """Log del progresso di un download"""
+        progress = (current / total) * 100 if total > 0 else 0
+        self.logger.debug(f"Progress: {filename} - {progress:.1f}% ({current}/{total} bytes) - {speed/1024/1024:.1f} MB/s")
+    
+    def log_download_complete(self, filename: str, duration: float):
+        """Log del completamento di un download"""
+        self.logger.info(f"✓ Download completed: {filename} in {duration:.1f}s")
+        self._log_to_detailed_file(
+            "COMPLETE",
+            filename,
+            "",
+            0,
+            "COMPLETED",
+            duration,
+            0,
+            "Download completed successfully"
+        )
+    
+    def log_download_error(self, filename: str, error: str, url: str = ""):
+        """Log di un errore durante il download"""
+        self.logger.error(f"✗ Download failed: {filename} - {error}")
+        self._log_to_detailed_file(
+            "ERROR",
+            filename,
+            url,
+            0,
+            "FAILED",
+            0,
+            0,
+            error
+        )
+        self._log_error(
+            error,
+            filename,
+            url,
+            traceback.format_exc()
+        )
+    
+    def log_chunk_status(self, filename: str, chunk_num: int, total_chunks: int, status: str):
+        """Log dello stato di un chunk di download"""
+        self.logger.debug(f"Chunk {chunk_num}/{total_chunks} of {filename}: {status}")
+    
+    def log_retry(self, filename: str, attempt: int, max_attempts: int, delay: float):
+        """Log di un tentativo di download"""
+        self.logger.warning(f"Retry {attempt}/{max_attempts} for {filename} after {delay:.1f}s")
+        self._log_to_detailed_file(
+            "RETRY",
+            filename,
+            "",
+            0,
+            "RETRYING",
+            0,
+            0,
+            f"Attempt {attempt}/{max_attempts}"
+        )
+    
+    def log_file_info(self, filename: str, url: str, size: int, file_type: str, dataset_url: str = ""):
+        """Log delle informazioni di un file"""
+        self.logger.info(f"File info: {filename} ({size/1024/1024:.1f} MB) - {file_type}")
+        self._log_to_detailed_file(
+            "INFO",
+            filename,
+            url,
+            size,
+            "INFO",
+            0,
+            0,
+            f"Type: {file_type}, Dataset: {dataset_url}"
+        )
+
+    def warning(self, message: str):
+        """Log di un warning"""
+        self.logger.warning(message)
+        self._log_to_detailed_file(
+            "WARNING",
+            "",
+            "",
+            0,
+            "WARNING",
+            0,
+            0,
+            message
+        )
+
+    def error(self, message: str):
+        """Log di un errore generico"""
+        self.logger.error(message)
+        self._log_to_detailed_file(
+            "ERROR",
+            "",
+            "",
+            0,
+            "ERROR",
+            0,
+            0,
+            message
+        )
 
 class RateLimiter:
     def __init__(self, calls_per_second=1):
@@ -48,214 +207,6 @@ class RateLimiter:
                 if time_since_last < 1.0 / self.calls_per_second:
                     await asyncio.sleep(1.0 / self.calls_per_second - time_since_last)
             self.last_call = time.time()
-
-class AdvancedLogger:
-    def __init__(self, log_file: str = "anac_downloader.log"):
-        # Usa la console globale che si adatta all'ambiente
-        self.console = console
-        self.log_file = log_file
-        self.detailed_log_file = "anac_downloader_detailed.log"
-        
-        # Configura il logging con Rich
-        if SIMPLE_TERMINAL:
-            # Configurazione più semplice per terminali limitati
-            logging.basicConfig(
-                level=logging.INFO,
-                format="[%(levelname)s] %(asctime)s - %(message)s",
-                datefmt="[%X]",
-                handlers=[
-                    logging.StreamHandler(),
-                    logging.FileHandler(log_file, encoding='utf-8')
-                ]
-            )
-        else:
-            # Configurazione completa per terminali moderni
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(message)s",
-                datefmt="[%X]",
-                handlers=[
-                    RichHandler(rich_tracebacks=True, markup=True),
-                    logging.FileHandler(log_file, encoding='utf-8')
-                ]
-            )
-        
-        self.logger = logging.getLogger("anac_downloader")
-        
-        # Crea il file di log con intestazione
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"=== ANAC Downloader Log ===\n")
-            f.write(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*50 + "\n\n")
-        
-        # Crea il file di log dettagliato con intestazione
-        with open(self.detailed_log_file, 'w', encoding='utf-8') as f:
-            f.write(f"=== ANAC Downloader Detailed Log ===\n")
-            f.write(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*50 + "\n\n")
-            f.write("TIMESTAMP,OPERATION,FILENAME,URL,SIZE,STATUS,DURATION,SPEED,NOTES\n")
-        
-        # Store download start times
-        self.download_start_times = {}
-        self.speed_history = {}
-        self.download_details = {}
-    
-    def _format_time(self, seconds: float) -> str:
-        """Formatta i secondi in un formato leggibile."""
-        if seconds < 60:
-            return f"{seconds:.1f}s"
-        elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.0f}m {seconds%60:.1f}s"
-        else:
-            hours = seconds / 3600
-            minutes = (seconds % 3600) / 60
-            return f"{hours:.0f}h {minutes:.1f}m"
-    
-    def _calculate_eta(self, filename: str, current: int, total: int, speed: float) -> str:
-        """Calcola l'ETA usando la velocità media degli ultimi aggiornamenti."""
-        if filename not in self.speed_history:
-            self.speed_history[filename] = []
-        
-        # Add current speed to history (keep last 5)
-        self.speed_history[filename].append(speed)
-        if len(self.speed_history[filename]) > 5:
-            self.speed_history[filename].pop(0)
-        
-        # Calculate average speed
-        avg_speed = sum(self.speed_history[filename]) / len(self.speed_history[filename])
-        
-        # Calculate ETA
-        if avg_speed > 0:
-            remaining_bytes = total - current
-            eta_seconds = remaining_bytes / avg_speed
-            return self._format_time(eta_seconds)
-        return "sconosciuto"
-    
-    def _log_to_detailed_file(self, operation, filename, url="", size=0, status="", duration=0, speed=0, notes=""):
-        """Scrive una riga nel file di log dettagliato in formato CSV."""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(self.detailed_log_file, 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp},{operation},{filename},{url},{size},{status},{duration},{speed},{notes}\n")
-    
-    def log_download_start(self, filename: str, size: int, url: str = ""):
-        """Log l'inizio di un download"""
-        self.download_start_times[filename] = time.time()
-        self.speed_history[filename] = []
-        self.download_details[filename] = {
-            "url": url,
-            "size": size,
-            "start_time": time.time()
-        }
-        self.logger.info(f"[bold green]Starting download:[/] {filename} ({self._format_size(size)})")
-        self._log_to_detailed_file("START", filename, url, size, "STARTED")
-    
-    def log_download_progress(self, filename: str, current: int, total: int, speed: float, elapsed: float):
-        """Log il progresso di un download con tempo trascorso e ETA"""
-        percentage = (current / total) * 100
-        
-        # Calcola l'ETA usando la velocità media
-        eta_str = self._calculate_eta(filename, current, total, speed)
-        
-        # Formatta il tempo trascorso
-        elapsed_str = self._format_time(elapsed)
-        
-        # Calcola la velocità media dall'inizio
-        if elapsed > 0:
-            avg_speed = current / elapsed / 1024  # KB/s
-        else:
-            avg_speed = 0
-        
-        self.logger.info(
-            f"[cyan]Progress:[/] {filename}\n"
-            f"├─ Progress: {percentage:.1f}% ({self._format_size(current)}/{self._format_size(total)})\n"
-            f"├─ Current Speed: {speed/1024:.1f} KB/s (Avg: {avg_speed:.1f} KB/s)\n"
-            f"├─ Elapsed: {elapsed_str}\n"
-            f"└─ ETA: {eta_str}"
-        )
-    
-    def log_download_complete(self, filename: str, duration: float):
-        """Log il completamento di un download"""
-        duration_str = self._format_time(duration)
-        
-        # Recupera i dettagli del download
-        details = self.download_details.get(filename, {})
-        url = details.get("url", "")
-        size = details.get("size", 0)
-        avg_speed = size / duration / 1024 if duration > 0 else 0  # KB/s
-        
-        # Clean up tracking data
-        if filename in self.download_start_times:
-            del self.download_start_times[filename]
-        if filename in self.speed_history:
-            del self.speed_history[filename]
-        if filename in self.download_details:
-            del self.download_details[filename]
-        
-        self.logger.info(f"[bold green]✓ Download completed:[/] {filename} in {duration_str}")
-        self._log_to_detailed_file("COMPLETE", filename, url, size, "COMPLETED", duration, avg_speed)
-    
-    def log_download_error(self, filename: str, error: str, url: str = ""):
-        """Log un errore di download"""
-        # Recupera i dettagli del download
-        details = self.download_details.get(filename, {})
-        size = details.get("size", 0)
-        duration = time.time() - self.download_start_times.get(filename, time.time())
-        
-        # Clean up tracking data
-        if filename in self.download_start_times:
-            del self.download_start_times[filename]
-        if filename in self.speed_history:
-            del self.speed_history[filename]
-        if filename in self.download_details:
-            del self.download_details[filename]
-        
-        self.logger.error(f"[bold red]✗ Download failed:[/] {filename} - {error}")
-        self._log_to_detailed_file("ERROR", filename, url, size, f"FAILED: {error}", duration)
-    
-    def log_chunk_status(self, filename: str, chunk_num: int, total_chunks: int, status: str):
-        """Log lo stato di un chunk"""
-        # Calculate elapsed time for this file if available
-        elapsed_str = ""
-        if filename in self.download_start_times:
-            elapsed = time.time() - self.download_start_times[filename]
-            elapsed_str = f" (elapsed: {self._format_time(elapsed)})"
-        
-        self.logger.info(
-            f"[yellow]Chunk {chunk_num}/{total_chunks}[/] for {filename}: {status}{elapsed_str}"
-        )
-        self._log_to_detailed_file("CHUNK", filename, "", 0, f"Chunk {chunk_num}/{total_chunks}: {status}")
-    
-    def log_retry(self, filename: str, attempt: int, max_attempts: int, delay: float):
-        """Log un tentativo di retry"""
-        # Calculate elapsed time for this file if available
-        elapsed_str = ""
-        if filename in self.download_start_times:
-            elapsed = time.time() - self.download_start_times[filename]
-            elapsed_str = f" (elapsed: {self._format_time(elapsed)})"
-        
-        self.logger.warning(
-            f"[yellow]Retry {attempt}/{max_attempts}[/] for {filename} "
-            f"after {delay:.1f}s delay{elapsed_str}"
-        )
-        self._log_to_detailed_file("RETRY", filename, "", 0, f"Retry {attempt}/{max_attempts} after {delay:.1f}s")
-    
-    def _format_size(self, size_bytes: int) -> str:
-        """Formatta i byte in un formato leggibile"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024
-        return f"{size_bytes:.1f} TB"
-    
-    def log_file_info(self, filename: str, url: str, size: int, file_type: str, dataset_url: str = ""):
-        """Log informazioni dettagliate su un file trovato"""
-        self.logger.info(f"[blue]File info:[/] {filename} ({self._format_size(size)}) - {file_type}")
-        self._log_to_detailed_file("INFO", filename, url, size, "FOUND", 0, 0, f"Type: {file_type}, Dataset: {dataset_url}")
-
-    def warning(self, message: str):
-        """Log un messaggio di warning."""
-        self.logger.warning(message)
 
 class ANACScraper:
     """Classe per lo scraping dei dataset ANAC."""
@@ -809,13 +760,13 @@ class ANACScraper:
             start_position = 0
             if os.path.exists(temp_file):
                 start_position = os.path.getsize(temp_file)
-                self.logger.info(f"Trovato download parziale: {start_position/(1024*1024):.1f}MB, riprendo da lì")
+                self.logger.logger.info(f"Trovato download parziale: {start_position/(1024*1024):.1f}MB, riprendo da lì")
             
             # Calcola quanti segmenti devono essere scaricati
             total_segments = math.ceil(file_size / segment_size)
             start_segment = start_position // segment_size
             
-            self.logger.info(f"Download segmentato per {os.path.basename(output_file)} ({file_size/(1024*1024):.1f}MB) - {total_segments} segmenti totali")
+            self.logger.logger.info(f"Download segmentato per {os.path.basename(output_file)} ({file_size/(1024*1024):.1f}MB) - {total_segments} segmenti totali")
             
             # Salva l'informazione nei download parziali
             filename = os.path.basename(output_file)
@@ -841,7 +792,7 @@ class ANACScraper:
                     # Massimo 5 tentativi per segmento
                     for attempt in range(5):
                         try:
-                            self.logger.info(f"Scarico segmento {segment_idx+1}/{total_segments} (byte {segment_start}-{segment_end})")
+                            self.logger.logger.info(f"Scarico segmento {segment_idx+1}/{total_segments} (byte {segment_start}-{segment_end})")
                             
                             # Applica rate limiting
                             await self.rate_limiter.acquire()
@@ -854,7 +805,7 @@ class ANACScraper:
                             # Effettua la richiesta
                             async with self.session.get(url, headers=headers, timeout=self.timeout, cookies=self.cookies) as response:
                                 if response.status not in (200, 206):  # 206 = Partial Content
-                                    self.logger.error(f"Risposta non valida ({response.status}) per il segmento {segment_idx+1}")
+                                    self.logger.logger.error(f"Risposta non valida ({response.status}) per il segmento {segment_idx+1}")
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
@@ -865,7 +816,7 @@ class ANACScraper:
                                 expected_size = segment_end - segment_start + 1
                                 
                                 if len(data) != expected_size:
-                                    self.logger.warning(f"Dimensioni segmento non corrispondono: previsto {expected_size}, ricevuto {len(data)}")
+                                    self.logger.logger.warning(f"Dimensioni segmento non corrispondono: previsto {expected_size}, ricevuto {len(data)}")
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
@@ -881,19 +832,19 @@ class ANACScraper:
                                 self.download_state['partial_downloads'][filename]['last_update'] = datetime.now().isoformat()
                                 self.save_state()
                                 
-                                self.logger.info(f"Progresso: {current_size/(1024*1024):.1f}MB / {file_size/(1024*1024):.1f}MB ({percentage:.1f}%)")
+                                self.logger.logger.info(f"Progresso: {current_size/(1024*1024):.1f}MB / {file_size/(1024*1024):.1f}MB ({percentage:.1f}%)")
                                 
                                 # Successo per questo segmento, interrompi il ciclo di tentativi
                                 break
                                 
                         except asyncio.TimeoutError:
-                            self.logger.warning(f"Timeout durante il download del segmento {segment_idx+1}")
+                            self.logger.logger.warning(f"Timeout durante il download del segmento {segment_idx+1}")
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
                             return False
                         except Exception as e:
-                            self.logger.error(f"Errore durante il download del segmento {segment_idx+1}: {str(e)}")
+                            self.logger.logger.error(f"Errore durante il download del segmento {segment_idx+1}: {str(e)}")
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
@@ -906,14 +857,14 @@ class ANACScraper:
                     # Verifica se il file di destinazione esiste già
                     if os.path.exists(output_file):
                         try:
-                            self.logger.info(f"Il file {output_file} esiste già. Tentativo di rimozione...")
+                            self.logger.logger.info(f"Il file {output_file} esiste già. Tentativo di rimozione...")
                             os.remove(output_file)
                         except Exception as e:
-                            self.logger.error(f"Impossibile rimuovere il file esistente: {str(e)}")
+                            self.logger.logger.error(f"Impossibile rimuovere il file esistente: {str(e)}")
                             # Se non possiamo rimuovere il file esistente, rinomina il file temporaneo con un altro nome
                             alternative_output = output_file + ".new"
                             os.rename(temp_file, alternative_output)
-                            self.logger.info(f"File rinominato come {alternative_output} invece di {output_file}")
+                            self.logger.logger.info(f"File rinominato come {alternative_output} invece di {output_file}")
                             output_file = alternative_output
                     
                     try:
@@ -930,331 +881,42 @@ class ANACScraper:
                             self.download_state['failed_files'].remove(filename)
                         self.save_state()
                         
-                        self.logger.info(f"Download completato: {os.path.basename(output_file)}")
+                        self.logger.logger.info(f"Download completato: {os.path.basename(output_file)}")
                         return True
                     except Exception as e:
-                        self.logger.error(f"Errore nel rinominare il file temporaneo: {str(e)}")
+                        self.logger.logger.error(f"Errore nel rinominare il file temporaneo: {str(e)}")
                         return False
                 else:
-                    self.logger.error(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
+                    self.logger.logger.error(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
             
             return False
             
         except Exception as e:
-            self.logger.error(f"Errore nel download a segmenti: {str(e)}")
+            self.logger.logger.error(f"Errore nel download a segmenti: {str(e)}")
             return False
 
-    async def _download_segment_with_curl(self, url, segment_file, start_byte, end_byte, segment_idx, limit_rate):
-        """Download a segment using curl with specific byte range."""
-        try:
-            cmd = [
-                "curl", "-L", "-o", segment_file,
-                "--retry", "10",
-                "--retry-delay", "15",
-                "--retry-max-time", "600",
-                "--connect-timeout", "60",
-                "--speed-time", "60",
-                "--speed-limit", "500",
-                "--limit-rate", f"{limit_rate}k",
-                "-H", f"User-Agent: {self.headers['User-Agent']}",
-                "-H", f"Referer: {self.headers['Referer']}",
-                "-H", f"Range: bytes={start_byte}-{end_byte}",
-                "-H", "Accept: */*",
-                "-H", "Connection: keep-alive",
-            ]
-            
-            # Add cookie file if available
-            cookie_file = None
-            if self.cookies:
-                try:
-                    cookie_file = f".curl_cookies_seg{segment_idx}.txt"
-                    with open(cookie_file, 'w') as f:
-                        for name, value in self.cookies.items():
-                            f.write(f"dati.anticorruzione.it\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n")
-                    cmd.extend(["--cookie", cookie_file])
-                except Exception as e:
-                    self.logger.error(f"Errore cookie per segmento {segment_idx}: {str(e)}")
-            
-            # Append or create mode
-            if os.path.exists(segment_file) and os.path.getsize(segment_file) > 0:
-                cmd.append("-C")
-                cmd.append("-")
-            
-            cmd.append(url)
-            
-            # Run curl
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            # Wait for completion with timeout (30 min)
-            return_code = await asyncio.wait_for(process.wait(), timeout=1800)
-            
-            # Clean up cookie file
-            if cookie_file and os.path.exists(cookie_file):
-                try:
-                    os.remove(cookie_file)
-                except:
-                    pass
-            
-            if return_code == 0:
-                # Verify segment size
-                if os.path.exists(segment_file):
-                    actual_size = os.path.getsize(segment_file)
-                    expected_size = end_byte - start_byte + 1
-                    
-                    if abs(actual_size - expected_size) <= 1024:  # Allow 1KB difference
-                        print(f"Segmento {segment_idx+1}: Completato ({actual_size/(1024*1024):.1f}MB)")
-                        return True
-            
-            print(f"Segmento {segment_idx+1}: Errore curl ({return_code})")
-            return False
-            
-        except Exception as e:
-            print(f"Segmento {segment_idx+1}: Errore curl - {str(e)}")
-            return False
-            
-    async def download_with_multi_connection(self, url, output_path, file_size):
-        """Download a file using multiple connections in parallel (IDM-style)."""
-        filename = os.path.basename(output_path)
-        temp_dir = os.path.join(os.path.dirname(output_path), ".temp")
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Use the configured number of connections
-        num_connections = self.download_options.get('num_connections', 1)  # Default to 1
-        print(f"Utilizzo {num_connections} connessioni per il download")
-        
-        # Smaller segment size for better resumability
-        segment_size = self.download_options.get('segment_size', 5 * 1024 * 1024)  # 5MB per segmento
-        
-        # Determine chunk size - each connection downloads a specific part
-        chunk_size = file_size // num_connections
-        if chunk_size < segment_size:  # Ensure minimum segment size
-            chunk_size = segment_size
-            num_connections = min(num_connections, file_size // chunk_size)
-            if num_connections < 1:
-                num_connections = 1
-            print(f"Ridimensionato a {num_connections} connessioni (min {segment_size/(1024*1024):.1f}MB per segmento)")
-        
-        # Create segment file paths
-        segment_files = []
-        for i in range(num_connections):
-            segment_files.append(os.path.join(temp_dir, f"{filename}.part{i}"))
-        
-        # Define ranges for each segment
-        ranges = []
-        for i in range(num_connections):
-            start = i * chunk_size
-            end = (i+1) * chunk_size - 1 if i < num_connections - 1 else file_size - 1
-            ranges.append((start, end))
-        
-        # Check if segments exist and get their size
-        for i, segment_file in enumerate(segment_files):
-            if os.path.exists(segment_file):
-                size = os.path.getsize(segment_file)
-                if size > 0:
-                    # If segment exists, adjust start position
-                    ranges[i] = (ranges[i][0] + size, ranges[i][1])
-                    print(f"Segmento {i+1}: Riprendo da {size} bytes")
-                    
-        # Nuova strategia: scarica un segmento alla volta per minimizzare gli errori
-        if num_connections == 1 or file_size < 20 * 1024 * 1024:  # Per file piccoli o se impostato a 1 connessione
-            print("Utilizzo strategia conservativa: un segmento alla volta")
-            for i, (start_byte, end_byte) in enumerate(ranges):
-                segment_file = segment_files[i]
-                success = await self._download_segment_conservative(url, segment_file, start_byte, end_byte, i)
-                if not success:
-                    print(f"Download del segmento {i+1} fallito dopo tutti i tentativi")
-                    return False
-            
-            # Se arriviamo qui, tutti i segmenti sono stati scaricati con successo
-            success = True
-        else:
-            # Download function for a segment
-            async def download_segment(session, segment_idx, start_byte, end_byte, segment_file):
-                if start_byte > end_byte:
-                    print(f"Segmento {segment_idx+1} già completato")
-                    return True
-                
-                headers = self.headers.copy()
-                headers['Range'] = f'bytes={start_byte}-{end_byte}'
-                
-                mode = 'ab' if os.path.exists(segment_file) else 'wb'
-                retries = 0
-                max_retries = 15  # More retries for segments
-                
-                while retries < max_retries:
-                    try:
-                        print(f"Segmento {segment_idx+1}: Download {start_byte}-{end_byte} ({(end_byte-start_byte+1)/(1024*1024):.1f}MB)")
-                        
-                        # Wait between retries with increasing delay
-                        if retries > 0:
-                            wait_time = min(30 * retries, 600)  # Max 10 minutes wait
-                            print(f"Segmento {segment_idx+1}: Attendo {wait_time}s prima di riprovare (tentativo {retries+1}/{max_retries})")
-                            await asyncio.sleep(wait_time)
-                        
-                        # Longer random delay to avoid simultaneous requests
-                        await asyncio.sleep(random.uniform(5, 15))
-                        
-                        # Set a lower timeout for individual segments
-                        timeout = aiohttp.ClientTimeout(total=1800)  # 30 minutes per segment
-                        
-                        # Lower rate limit for individual segments
-                        limit_rate = self.download_options.get('limit_rate', 200) // num_connections
-                        
-                        # Use curl for segment download if available
-                        if self.curl_available and start_byte < end_byte:
-                            return await self._download_segment_with_curl(url, segment_file, start_byte, end_byte, segment_idx, limit_rate)
-                        
-                        # Fall back to aiohttp if curl not available
-                        async with self.session.get(url, headers=headers, timeout=timeout) as response:
-                            if response.status not in (200, 206):
-                                print(f"Segmento {segment_idx+1}: Errore HTTP {response.status}")
-                                retries += 1
-                                continue
-                            
-                            with open(segment_file, mode) as f:
-                                downloaded = 0
-                                async for chunk in response.content.iter_chunked(8192):
-                                    if not chunk:
-                                        break
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    # Periodically update progress
-                                    if downloaded % (512*1024) == 0:  # Update every 512KB
-                                        current = start_byte + downloaded
-                                        percent = (current - ranges[segment_idx][0]) / (end_byte - ranges[segment_idx][0] + 1) * 100
-                                        print(f"Segmento {segment_idx+1}: {percent:.1f}% completato")
-                        
-                        # Verify segment size
-                        if os.path.exists(segment_file):
-                            actual_size = os.path.getsize(segment_file)
-                            expected_size = (end_byte - ranges[segment_idx][0] + 1) + (start_byte - ranges[segment_idx][0])
-                            
-                            if abs(actual_size - expected_size) <= 1024:  # Allow 1KB difference
-                                print(f"Segmento {segment_idx+1}: Completato ({actual_size/(1024*1024):.1f}MB)")
-                                return True
-                            else:
-                                print(f"Segmento {segment_idx+1}: Dimensione non corrisponde. Attesa: {expected_size}, Reale: {actual_size}")
-                                # If we downloaded something, adjust start position and continue
-                                if actual_size > 0:
-                                    start_byte = ranges[segment_idx][0] + actual_size
-                                    headers['Range'] = f'bytes={start_byte}-{end_byte}'
-                                    mode = 'ab'  # Append mode
-                        
-                        retries += 1
-                    
-                    except asyncio.TimeoutError:
-                        print(f"Segmento {segment_idx+1}: Timeout")
-                        retries += 1
-                        # Adjust range if partial data was downloaded
-                        if os.path.exists(segment_file):
-                            actual_size = os.path.getsize(segment_file)
-                            if actual_size > 0:
-                                start_byte = ranges[segment_idx][0] + actual_size
-                                headers['Range'] = f'bytes={start_byte}-{end_byte}'
-                                mode = 'ab'  # Append mode
-                    
-                    except Exception as e:
-                        print(f"Segmento {segment_idx+1}: Errore - {str(e)}")
-                        retries += 1
-                
-                print(f"Segmento {segment_idx+1}: Fallito dopo {max_retries} tentativi")
-                return False
-            
-            # Start downloading all segments in parallel
-            tasks = []
-            for i in range(num_connections):
-                start_byte, end_byte = ranges[i]
-                task = asyncio.create_task(
-                    download_segment(self.session, i, start_byte, end_byte, segment_files[i])
-                )
-                tasks.append(task)
-            
-            # Wait for all segments to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Check if all segments completed successfully
-            success = True
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Segmento {i+1}: Eccezione - {str(result)}")
-                    success = False
-                elif not result:
-                    print(f"Segmento {i+1}: Download fallito")
-                    success = False
-        
-        if success:
-            # All segments downloaded successfully, merge them
-            try:
-                print(f"Tutti i segmenti completati. Unione in corso...")
-                with open(output_path, 'wb') as outfile:
-                    for segment_file in segment_files:
-                        if os.path.exists(segment_file):
-                            with open(segment_file, 'rb') as infile:
-                                while True:
-                                    data = infile.read(8192)
-                                    if not data:
-                                        break
-                                    outfile.write(data)
-                
-                # Verify final file size
-                if os.path.exists(output_path):
-                    final_size = os.path.getsize(output_path)
-                    if abs(final_size - file_size) <= 1024:  # Allow 1KB difference
-                        print(f"✓ File completato: {filename} ({final_size/(1024*1024):.1f}MB)")
-                        
-                        # Cleanup segment files
-                        for segment_file in segment_files:
-                            try:
-                                if os.path.exists(segment_file):
-                                    os.remove(segment_file)
-                            except:
-                                pass
-                        
-                        # Update download state
-                        if filename in self.download_state['failed_files']:
-                            self.download_state['failed_files'].remove(filename)
-                        if filename in self.download_state['partial_downloads']:
-                            del self.download_state['partial_downloads'][filename]
-                        if filename not in self.download_state['completed_files']:
-                            self.download_state['completed_files'].append(filename)
-                        self.save_state()
-                        
-                        return True
-                    else:
-                        print(f"✗ Dimensione file finale non corrisponde: {final_size} vs {file_size}")
-            except Exception as e:
-                print(f"Errore durante l'unione dei segmenti: {str(e)}")
-        
-        # If we get here, something failed. Keep segment files for resuming later.
-        print(f"Download multi-connessione non completato. I segmenti sono stati conservati per la ripresa.")
-        
-        # Update partial download state
-        self.download_state['partial_downloads'][filename] = {
-            'url': url,
-            'path': output_path,
-            'segments': [
-                {
-                    'file': segment_file,
-                    'range': ranges[i]
-                } for i, segment_file in enumerate(segment_files) if os.path.exists(segment_file)
-            ],
-            'total_bytes': file_size,
-            'last_attempt': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.save_state()
-        
-        return False
-        
     async def _download_segment_conservative(self, url, segment_file, start_byte, end_byte, segment_idx):
-        """Download a segment using a more conservative approach with smaller chunks."""
-        print(f"Avvio download conservativo per segmento {segment_idx+1}")
+        """Download a segment using a dynamic approach that starts aggressive and becomes conservative on errors."""
+        self.logger.logger.info(f"\n{'='*80}")
+        self.logger.logger.info(f"Avvio download per segmento {segment_idx+1}")
+        self.logger.logger.info(f"File: {os.path.basename(segment_file)}")
+        self.logger.logger.info(f"URL: {url}")
         
-        # Chunk size for conservative download (1MB chunks)
-        chunk_size = 1 * 1024 * 1024  # 1MB
+        # Calcola la dimensione totale del segmento
+        total_bytes = end_byte - start_byte + 1
+        
+        # Calcola la dimensione iniziale del chunk in base alla dimensione totale
+        if total_bytes < 100 * 1024 * 1024:  # < 100MB
+            initial_chunk_size = 5 * 1024 * 1024  # 5MB
+        elif total_bytes < 1024 * 1024 * 1024:  # < 1GB
+            initial_chunk_size = 10 * 1024 * 1024  # 10MB
+        else:  # >= 1GB
+            initial_chunk_size = 20 * 1024 * 1024  # 20MB
+            
+        # Chunk size minimo (1MB) e massimo (50MB)
+        min_chunk_size = 1 * 1024 * 1024  # 1MB
+        max_chunk_size = 50 * 1024 * 1024  # 50MB
+        current_chunk_size = min(initial_chunk_size, max_chunk_size)
         
         # Ensure segment directory exists
         os.makedirs(os.path.dirname(segment_file), exist_ok=True)
@@ -1268,42 +930,62 @@ class ANACScraper:
         current_size = os.path.getsize(segment_file)
         if current_size > 0:
             start_byte += current_size
+            self.logger.logger.info(f"Riprendo download da {current_size/(1024*1024):.1f}MB")
         
         # Check if already complete
         if start_byte >= end_byte:
-            print(f"Segmento {segment_idx+1} già completo")
+            self.logger.logger.info(f"Segmento {segment_idx+1} già completo")
             return True
         
         # Calculate number of chunks
         total_bytes = end_byte - start_byte + 1
-        num_chunks = math.ceil(total_bytes / chunk_size)
+        num_chunks = math.ceil(total_bytes / current_chunk_size)
         
-        print(f"Segmento {segment_idx+1} diviso in {num_chunks} mini-chunks da {chunk_size/1024/1024:.1f}MB")
+        self.logger.logger.info(f"\nStatistiche iniziali:")
+        self.logger.logger.info(f"Dimensione totale: {total_bytes/(1024*1024):.1f}MB")
+        self.logger.logger.info(f"Numero di chunk: {num_chunks}")
+        self.logger.logger.info(f"Dimensione chunk iniziale: {current_chunk_size/(1024*1024):.1f}MB")
+        self.logger.logger.info(f"Rate limit: {self.download_options.get('limit_rate', 200)}KB/s")
+        self.logger.logger.info(f"{'='*80}\n")
         
         # Start download
         current_byte = start_byte
         mode = 'ab'  # Always append
+        consecutive_errors = 0  # Contatore errori consecutivi
+        max_consecutive_errors = 3  # Dopo 3 errori consecutivi, riduci la dimensione del chunk
         
-        for chunk_idx in range(num_chunks):
+        # Variabili per il calcolo della velocità
+        last_chunk_time = time.time()
+        last_chunk_size = 0
+        total_downloaded = 0
+        start_time = time.time()
+        
+        while current_byte <= end_byte:
             chunk_start = current_byte
-            chunk_end = min(chunk_start + chunk_size - 1, end_byte)
+            chunk_end = min(chunk_start + current_chunk_size - 1, end_byte)
             
-            print(f"Segmento {segment_idx+1}, Chunk {chunk_idx+1}/{num_chunks}: Scaricando bytes {chunk_start}-{chunk_end}")
+            # Calcola il progresso
+            progress = (current_byte - start_byte) / (end_byte - start_byte + 1) * 100
+            current_chunk = (current_byte - start_byte) // current_chunk_size + 1
             
-            # Try up to 5 times for each chunk
-            for attempt in range(5):
+            self.logger.logger.info(f"\nChunk {current_chunk}/{num_chunks} ({progress:.1f}%)")
+            self.logger.logger.info(f"Bytes: {chunk_start}-{chunk_end}")
+            self.logger.logger.info(f"Chunk size: {current_chunk_size/(1024*1024):.1f}MB")
+            self.logger.logger.info(f"Consecutive errors: {consecutive_errors}")
+            
+            # Calcola il delay in base agli errori consecutivi
+            if consecutive_errors > 0:
+                delay = min(5 * (2 ** consecutive_errors), 30)  # Max 30 secondi
+                self.logger.logger.info(f"Attesa di {delay}s prima del tentativo (errori consecutivi: {consecutive_errors})")
+                await asyncio.sleep(delay)
+            else:
+                # Delay minimo tra i chunks quando non ci sono errori
+                delay = random.uniform(1, 3)
+                await asyncio.sleep(delay)
+            
+            # Try up to 3 times for each chunk
+            for attempt in range(3):
                 try:
-                    # Add delay between chunks and attempts
-                    if attempt > 0:
-                        delay = 10 * (2 ** attempt)  # Exponential backoff
-                        print(f"Attesa di {delay}s prima del tentativo {attempt+1}/5")
-                        await asyncio.sleep(delay)
-                    else:
-                        # Random delay between chunks
-                        delay = random.uniform(5, 15)
-                        print(f"Attesa di {delay:.1f}s tra chunks")
-                        await asyncio.sleep(delay)
-                    
                     # Prepare headers with range
                     headers = self.headers.copy()
                     headers['Range'] = f'bytes={chunk_start}-{chunk_end}'
@@ -1313,21 +995,60 @@ class ANACScraper:
                     
                     # Use curl for each chunk if available
                     if self.curl_available:
-                        success = await self._download_chunk_with_curl(url, segment_file, chunk_start, chunk_end, segment_idx, chunk_idx, limit_rate, mode)
+                        chunk_start_time = time.time()
+                        success = await self._download_chunk_with_curl(url, segment_file, chunk_start, chunk_end, segment_idx, attempt, limit_rate, mode)
                         if success:
+                            chunk_end_time = time.time()
+                            chunk_duration = chunk_end_time - chunk_start_time
+                            chunk_size = chunk_end - chunk_start + 1
+                            speed = (chunk_size / chunk_duration) / (1024 * 1024)  # MB/s
+                            
                             current_byte = chunk_end + 1
+                            total_downloaded += chunk_size
+                            consecutive_errors = 0  # Reset error counter on success
+                            
+                            # Calcola ETA
+                            remaining_bytes = end_byte - current_byte + 1
+                            if speed > 0:
+                                eta = remaining_bytes / (speed * 1024 * 1024)  # secondi
+                                eta_str = f"{int(eta//60)}m {int(eta%60)}s"
+                            else:
+                                eta_str = "N/A"
+                            
+                            self.logger.logger.info(f"\nStatistiche chunk:")
+                            self.logger.logger.info(f"Velocità: {speed:.2f} MB/s")
+                            self.logger.logger.info(f"Tempo impiegato: {chunk_duration:.1f}s")
+                            self.logger.logger.info(f"ETA: {eta_str}")
+                            self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
+                            
+                            # Se abbiamo ridotto il chunk size e ora funziona, prova ad aumentarlo
+                            if current_chunk_size < initial_chunk_size:
+                                current_chunk_size = min(current_chunk_size * 2, initial_chunk_size)
+                                self.logger.logger.info(f"Download riuscito, aumento chunk size a {current_chunk_size/1024/1024:.1f}MB")
                             break  # Success, move to next chunk
-                        elif attempt == 4:  # Last attempt failed
-                            print(f"Chunk {chunk_idx+1} fallito dopo 5 tentativi")
+                        elif attempt == 2:  # Last attempt failed
+                            self.logger.logger.error(f"Chunk fallito dopo 3 tentativi")
+                            consecutive_errors += 1
+                            # Riduci la dimensione del chunk se possibile
+                            if current_chunk_size > min_chunk_size:
+                                current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
+                                self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
+                                break  # Riprova con chunk più piccolo
                             return False
                     else:
                         # Use aiohttp fallback
                         timeout = aiohttp.ClientTimeout(total=600)  # 10 minutes per chunk
                         
+                        chunk_start_time = time.time()
                         async with self.session.get(url, headers=headers, timeout=timeout) as response:
                             if response.status not in (200, 206):
-                                print(f"Errore HTTP {response.status} per chunk {chunk_idx+1}")
-                                if attempt == 4:  # Last attempt
+                                self.logger.logger.error(f"Errore HTTP {response.status}")
+                                if attempt == 2:  # Last attempt
+                                    consecutive_errors += 1
+                                    if current_chunk_size > min_chunk_size:
+                                        current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
+                                        self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
+                                        break  # Riprova con chunk più piccolo
                                     return False
                                 continue  # Try again
                             
@@ -1336,8 +1057,13 @@ class ANACScraper:
                             # Verify data size
                             expected_size = chunk_end - chunk_start + 1
                             if len(data) != expected_size:
-                                print(f"Dimensione data non corretta: atteso {expected_size}, ricevuto {len(data)}")
-                                if attempt == 4:  # Last attempt
+                                self.logger.logger.error(f"Dimensione data non corretta: atteso {expected_size}, ricevuto {len(data)}")
+                                if attempt == 2:  # Last attempt
+                                    consecutive_errors += 1
+                                    if current_chunk_size > min_chunk_size:
+                                        current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
+                                        self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
+                                        break  # Riprova con chunk più piccolo
                                     return False
                                 continue  # Try again
                             
@@ -1346,16 +1072,60 @@ class ANACScraper:
                                 f.seek(current_byte - start_byte)  # Position in file
                                 f.write(data)
                             
+                            chunk_end_time = time.time()
+                            chunk_duration = chunk_end_time - chunk_start_time
+                            chunk_size = len(data)
+                            speed = (chunk_size / chunk_duration) / (1024 * 1024)  # MB/s
+                            
                             current_byte = chunk_end + 1
+                            total_downloaded += chunk_size
+                            consecutive_errors = 0  # Reset error counter on success
+                            
+                            # Calcola ETA
+                            remaining_bytes = end_byte - current_byte + 1
+                            if speed > 0:
+                                eta = remaining_bytes / (speed * 1024 * 1024)  # secondi
+                                eta_str = f"{int(eta//60)}m {int(eta%60)}s"
+                            else:
+                                eta_str = "N/A"
+                            
+                            self.logger.logger.info(f"\nStatistiche chunk:")
+                            self.logger.logger.info(f"Velocità: {speed:.2f} MB/s")
+                            self.logger.logger.info(f"Tempo impiegato: {chunk_duration:.1f}s")
+                            self.logger.logger.info(f"ETA: {eta_str}")
+                            self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
+                            
+                            # Se abbiamo ridotto il chunk size e ora funziona, prova ad aumentarlo
+                            if current_chunk_size < initial_chunk_size:
+                                current_chunk_size = min(current_chunk_size * 2, initial_chunk_size)
+                                self.logger.logger.info(f"Download riuscito, aumento chunk size a {current_chunk_size/1024/1024:.1f}MB")
                             break  # Success, move to next chunk
                 except Exception as e:
-                    print(f"Errore durante download chunk {chunk_idx+1}: {str(e)}")
-                    if attempt == 4:  # Last attempt
+                    self.logger.logger.error(f"Errore durante download: {str(e)}")
+                    if attempt == 2:  # Last attempt
+                        consecutive_errors += 1
+                        if current_chunk_size > min_chunk_size:
+                            current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
+                            self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
+                            break  # Riprova con chunk più piccolo
                         return False
             
-            # Update progress after each chunk
-            progress = (current_byte - start_byte) / (end_byte - start_byte + 1) * 100
-            print(f"Segmento {segment_idx+1}: {progress:.1f}% completato ({(current_byte-start_byte)/(1024*1024):.1f}MB/{total_bytes/(1024*1024):.1f}MB)")
+            # Se abbiamo troppi errori consecutivi, diventa più conservativo
+            if consecutive_errors >= max_consecutive_errors:
+                self.logger.logger.warning(f"Troppi errori consecutivi ({consecutive_errors}). Divento più conservativo...")
+                await asyncio.sleep(30)  # Attesa più lunga
+                consecutive_errors = 0  # Reset dopo l'attesa
+        
+        # Calcola statistiche finali
+        total_time = time.time() - start_time
+        avg_speed = (total_downloaded / total_time) / (1024 * 1024)  # MB/s
+        
+        self.logger.logger.info(f"\n{'='*80}")
+        self.logger.logger.info(f"Statistiche finali:")
+        self.logger.logger.info(f"Tempo totale: {total_time:.1f}s")
+        self.logger.logger.info(f"Velocità media: {avg_speed:.2f} MB/s")
+        self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
+        self.logger.logger.info(f"{'='*80}\n")
         
         # Verify final segment size
         if os.path.exists(segment_file):
@@ -1363,10 +1133,10 @@ class ANACScraper:
             expected_size = end_byte - start_byte + 1 + current_size  # Include existing data
             
             if abs(final_size - expected_size) <= 1024:  # Allow 1KB difference
-                print(f"✓ Segmento {segment_idx+1} completato: {final_size/(1024*1024):.1f}MB")
+                self.logger.logger.info(f"✓ Segmento {segment_idx+1} completato: {final_size/(1024*1024):.1f}MB")
                 return True
             else:
-                print(f"✗ Dimensione segmento non corrisponde: atteso {expected_size/(1024*1024):.1f}MB, ottenuto {final_size/(1024*1024):.1f}MB")
+                self.logger.logger.error(f"✗ Dimensione segmento non corrisponde: atteso {expected_size/(1024*1024):.1f}MB, ottenuto {final_size/(1024*1024):.1f}MB")
                 return False
         
         return False
@@ -1683,29 +1453,14 @@ class ANACScraper:
                             'dataset': os.path.basename(dataset_url)
                         })
             
-            # Rimuovi duplicati mantenendo il primo URL per ogni nome file
-            seen_filenames = set()
+            # Rimuovi duplicati basati sull'URL
             unique_json_files = []
+            seen_urls = set()
             for file_info in json_files:
-                filename = file_info['filename']
-                # Verifica ulteriore che non sia un file invalido
-                if (filename and 
-                    not any(pattern in filename.lower() for pattern in ['#', 'mailto', 'accessibilit']) and
-                    (filename.lower().endswith('.json') or filename.lower().endswith('.zip'))):
-                    
-                    if filename not in seen_filenames:
-                        seen_filenames.add(filename)
-                        unique_json_files.append(file_info)
+                if file_info['url'] not in seen_urls:
+                    seen_urls.add(file_info['url'])
+                    unique_json_files.append(file_info)
             
-            self.logger.logger.info(f"Trovati {len(unique_json_files)} file JSON/ZIP unici")
-            
-            # Aggiungi dettagli sui file trovati per debug
-            if unique_json_files:
-                for file_info in unique_json_files:
-                    self.logger.logger.info(f"File trovato: {file_info['filename']} ({self._format_size(file_info['size'])})")
-            else:
-                self.logger.logger.warning(f"Nessun file trovato in {dataset_url}")
-                
             return unique_json_files
             
         except Exception as e:
@@ -1915,676 +1670,385 @@ class ANACScraper:
         return dataset_pages
 
 async def main():
-    """Funzione principale per il download completo di tutti i dataset."""
-    # Crea le directory per i download
-    output_dir = "downloads"
-    os.makedirs(os.path.join(output_dir, "json"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "csv"), exist_ok=True)
+    """Funzione principale per il download dei dataset."""
+    # Crea le directory necessarie
+    os.makedirs('downloads/json', exist_ok=True)
+    os.makedirs('downloads/csv', exist_ok=True)
     
-    # File JSON di appoggio per i dataset e i relativi file
-    datasets_cache_file = "datasets_cache.json"
+    # Inizializza il logger
+    logger = AdvancedLogger()
     
-    print("\nAnalizziamo il sito dati.anticorruzione.it per trovare tutti i dataset disponibili...")
-    
-    try:
-        async with ANACScraper() as scraper:
+    # Carica o crea il file di cache
+    cache_file = 'datasets_cache.json'
+    cache_data = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            logger.logger.info("Cache caricata con successo")
+        except Exception as e:
+            logger.logger.error(f"Errore nel caricamento della cache: {str(e)}")
             cache_data = {}
-            
-            # Controlla se esiste già un file cache
-            if os.path.exists(datasets_cache_file):
-                try:
-                    with open(datasets_cache_file, 'r') as f:
-                        cache_data = json.load(f)
-                    print(f"\nUtilizzo cache esistente con {len(cache_data.get('datasets', {}))} dataset")
-                    
-                    # Validità della cache: se è più vecchia di 7 giorni, la consideriamo scaduta
-                    if 'last_updated' in cache_data:
-                        last_updated = datetime.fromisoformat(cache_data['last_updated'])
-                        days_old = (datetime.now() - last_updated).days
-                        if days_old > 7:
-                            print(f"La cache è vecchia di {days_old} giorni. Aggiornamento in corso...")
-                            cache_data = {}  # Reset della cache
-                except Exception as e:
-                    print(f"Errore nella lettura della cache: {str(e)}. Creazione di una nuova cache.")
-                    cache_data = {}
-            
-            # Se non abbiamo una cache valida, recupera la lista completa dei dataset
-            if not cache_data or 'datasets' not in cache_data:
-                print("\nRecupero lista completa dei dataset...")
-                dataset_pages = await scraper.get_dataset_pages()
-                total_datasets = len(dataset_pages)
-                print(f"\n✓ Trovati {total_datasets} dataset totali")
-                
-                # Inizializza la cache
-                cache_data = {
-                    'last_updated': datetime.now().isoformat(),
-                    'total_datasets': total_datasets,
-                    'datasets': {}
+    
+    # Verifica se la cache è valida
+    is_cache_valid = False
+    if cache_data and 'datasets' in cache_data:
+        is_cache_valid = True
+        logger.logger.info(f"Cache valida con {len(cache_data['datasets'])} dataset")
+    
+    # Se la cache non è valida, recupera la lista dei dataset
+    if not is_cache_valid:
+        logger.logger.info("Cache non valida o non presente, recupero lista dataset...")
+        dataset_pages = await get_dataset_pages()
+        if not dataset_pages:
+            logger.logger.error("Impossibile recuperare la lista dei dataset")
+            return
+        logger.logger.info(f"Trovati {len(dataset_pages)} dataset")
+    else:
+        # La cache usa un dizionario dove le chiavi sono gli URL dei dataset
+        dataset_pages = list(cache_data['datasets'].keys())
+        logger.logger.info(f"Utilizzo {len(dataset_pages)} dataset dalla cache")
+    
+    # Chiedi all'utente cosa vuole fare
+    print("\nCosa vuoi fare?")
+    print("1. Esegui una scansione approfondita di tutti i dataset")
+    print("2. Usa la cache esistente per il download")
+    print("3. Esci")
+    
+    choice = input("\nScelta: ").strip()
+    
+    if choice == "3":
+        print("\nOperazione annullata.")
+        return
+    
+    if choice == "1":
+        # Mostra progresso
+        print("\nAnalisi dettagli dei dataset...")
+        
+        # Analizziamo tutti i dataset, non solo un campione
+        total_json_files = 0
+        total_csv_files = 0
+        processed_datasets = 0
+        skipped_datasets = 0
+        errored_datasets = 0
+        
+        # Usa rich per mostrare una tabella di progresso
+        from rich.live import Live
+        from rich.table import Table
+        
+        def generate_stats_table():
+            table = Table(title="Stato Scansione Dataset")
+            table.add_column("Metriche", justify="left", style="cyan")
+            table.add_column("Valore", justify="right", style="green")
+            table.add_row("Dataset Processati", str(processed_datasets))
+            table.add_row("Dataset Saltati", str(skipped_datasets))
+            table.add_row("Dataset con Errori", str(errored_datasets))
+            table.add_row("File JSON Trovati", str(total_json_files))
+            table.add_row("File CSV Trovati", str(total_csv_files))
+            return table
+        
+        # Processa tutti i dataset con visualizzazione in tempo reale
+        with Live(generate_stats_table(), refresh_per_second=4) as live:
+            for i, dataset_url in enumerate(dataset_pages):
+                current_dataset_info = {
+                    'url': dataset_url,
+                    'json_files': [],
+                    'csv_files': [],
+                    'analyzed': False
                 }
                 
-                # Mostra progresso
-                print("\nAnalisi dettagli dei dataset...")
+                # Verifica se il dataset è già nella cache
+                dataset_in_cache = False
+                if cache_data and 'datasets' in cache_data:
+                    for cached_dataset in cache_data['datasets']:
+                        if cached_dataset['url'] == dataset_url:
+                            dataset_in_cache = True
+                            current_dataset_info = cached_dataset
+                            break
                 
-                # Analizziamo tutti i dataset, non solo un campione
-                total_json_files = 0
-                total_csv_files = 0
-                
-                # Counter per file trovati in tempo reale
-                real_json_counter = 0
-                real_csv_counter = 0
-                processed_datasets = 0
-                skipped_datasets = 0
-                error_datasets = 0
-                
-                # Crea una tabella per i contatori in tempo reale
-                from rich.live import Live
-                from rich.table import Table
-                
-                def generate_stats_table():
-                    table = Table(title="Stato Scansione Dataset")
-                    table.add_column("Metriche", justify="left", style="cyan")
-                    table.add_column("Valore", justify="right", style="green")
-                    
-                    table.add_row("Dataset Processati", f"{processed_datasets}/{total_datasets} ({processed_datasets/total_datasets*100:.1f}%)")
-                    table.add_row("Dataset Saltati", str(skipped_datasets))
-                    table.add_row("Dataset con Errori", str(error_datasets))
-                    table.add_row("File JSON Trovati", str(real_json_counter))
-                    table.add_row("File CSV Trovati", str(real_csv_counter))
-                    table.add_row("Totale File", str(real_json_counter + real_csv_counter))
-                    
-                    if processed_datasets > 0:
-                        table.add_row("Media JSON per Dataset", f"{real_json_counter/processed_datasets:.2f}")
-                    
-                    return table
-                
-                # Se siamo in un terminale limitato, usa l'output semplice
-                if SIMPLE_TERMINAL:
-                    # Processa tutti i dataset con output semplice
-                    for i, dataset_url in enumerate(dataset_pages):
-                        current_dataset_info = {
-                            'url': dataset_url,
-                            'json_files': [],
-                            'csv_files': [],
-                            'analyzed': False,
-                            'error': None,
-                            'processing_time': 0
-                        }
-                        
-                        # Verifica se questo dataset è già stato analizzato e salvato nella cache
-                        if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url].get('analyzed', False):
-                            processed_datasets += 1
-                            skipped_datasets += 1
-                            real_json_counter += len(cache_data['datasets'][dataset_url].get('json_files', []))
-                            real_csv_counter += len(cache_data['datasets'][dataset_url].get('csv_files', []))
-                            print(f"Dataset {processed_datasets}/{total_datasets} ({dataset_url}): saltato (già in cache)")
-                            continue
-                        
-                        start_time = time.time()
-                        
-                        try:
-                            # Recupera i file JSON
-                            json_files = await scraper.get_json_files(dataset_url)
+                if not dataset_in_cache:
+                    try:
+                        # Recupera i file JSON
+                        json_files = await get_json_files(dataset_url)
+                        if json_files:
                             current_dataset_info['json_files'] = json_files
-                            real_json_counter += len(json_files)
-                            
-                            # Recupera i file CSV
-                            csv_files = await scraper.get_csv_files(dataset_url)
+                            total_json_files += len(json_files)
+                        
+                        # Recupera i file CSV
+                        csv_files = await get_csv_files(dataset_url)
+                        if csv_files:
                             current_dataset_info['csv_files'] = csv_files
-                            real_csv_counter += len(csv_files)
-                            
-                            current_dataset_info['analyzed'] = True
-                            processed_datasets += 1
-                            processing_time = time.time() - start_time
-                            
-                            print(f"Dataset {processed_datasets}/{total_datasets} ({processed_datasets/total_datasets*100:.1f}%): "
-                                  f"{len(json_files)} JSON, {len(csv_files)} CSV - {processing_time:.1f}s")
-                            
-                        except Exception as e:
-                            current_dataset_info['error'] = str(e)
-                            error_datasets += 1
-                            processed_datasets += 1
-                            scraper.logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
-                            print(f"Dataset {processed_datasets}/{total_datasets}: ERRORE - {str(e)}")
+                            total_csv_files += len(csv_files)
                         
-                        # Calcola il tempo di elaborazione
-                        current_dataset_info['processing_time'] = time.time() - start_time
+                        current_dataset_info['analyzed'] = True
+                        processed_datasets += 1
                         
-                        # Aggiungiamo il dataset alla cache
-                        cache_data['datasets'][dataset_url] = current_dataset_info
-                        
-                        # Salviamo periodicamente la cache
-                        if i % 10 == 0 or i == total_datasets - 1:
-                            cache_data['last_updated'] = datetime.now().isoformat()
-                            cache_data['total_json_files'] = real_json_counter
-                            cache_data['total_csv_files'] = real_csv_counter
-                            
-                            with open(datasets_cache_file, 'w') as f:
-                                json.dump(cache_data, f, indent=2)
-                else:
-                    # Processa tutti i dataset con visualizzazione in tempo reale
-                    with Live(generate_stats_table(), refresh_per_second=4) as live:
-                        for i, dataset_url in enumerate(dataset_pages):
-                            current_dataset_info = {
-                                'url': dataset_url,
-                                'json_files': [],
-                                'csv_files': [],
-                                'analyzed': False,
-                                'error': None,
-                                'processing_time': 0
-                            }
-                            
-                            # Verifica se questo dataset è già stato analizzato e salvato nella cache
-                            if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url].get('analyzed', False):
-                                processed_datasets += 1
-                                skipped_datasets += 1
-                                real_json_counter += len(cache_data['datasets'][dataset_url].get('json_files', []))
-                                real_csv_counter += len(cache_data['datasets'][dataset_url].get('csv_files', []))
-                                live.update(generate_stats_table())
-                                continue
-                            
-                            start_time = time.time()
-                            
-                            try:
-                                # Recupera i file JSON
-                                json_files = await scraper.get_json_files(dataset_url)
-                                current_dataset_info['json_files'] = json_files
-                                real_json_counter += len(json_files)
-                                
-                                # Recupera i file CSV
-                                csv_files = await scraper.get_csv_files(dataset_url)
-                                current_dataset_info['csv_files'] = csv_files
-                                real_csv_counter += len(csv_files)
-                                
-                                current_dataset_info['analyzed'] = True
-                                processed_datasets += 1
-                                
-                            except Exception as e:
-                                current_dataset_info['error'] = str(e)
-                                error_datasets += 1
-                                processed_datasets += 1
-                                scraper.logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
-                            
-                            # Calcola il tempo di elaborazione
-                            current_dataset_info['processing_time'] = time.time() - start_time
-                            
-                            # Aggiungiamo il dataset alla cache
-                            cache_data['datasets'][dataset_url] = current_dataset_info
-                            
-                            # Aggiorna la visualizzazione
-                            live.update(generate_stats_table())
-                            
-                            # Salviamo periodicamente la cache
-                            if i % 10 == 0 or i == total_datasets - 1:
-                                cache_data['last_updated'] = datetime.now().isoformat()
-                                cache_data['total_json_files'] = real_json_counter
-                                cache_data['total_csv_files'] = real_csv_counter
-                                
-                                with open(datasets_cache_file, 'w') as f:
-                                    json.dump(cache_data, f, indent=2)
-                
-                # Salva la cache finale
-                cache_data['last_updated'] = datetime.now().isoformat()
-                cache_data['total_json_files'] = real_json_counter
-                cache_data['total_csv_files'] = real_csv_counter
-                
-                with open(datasets_cache_file, 'w') as f:
-                    json.dump(cache_data, f, indent=2)
-                
-                print("\n✓ Analisi completa terminata e salvata nel file cache")
-                
-                # Rapporto dettagliato
-                print(f"\nRAPPORTO FINALE:")
-                print(f"✓ Dataset analizzati: {processed_datasets}/{total_datasets}")
-                print(f"✓ Dataset saltati (già in cache): {skipped_datasets}")
-                print(f"✓ Dataset con errori: {error_datasets}")
-                print(f"✓ File JSON effettivi trovati: {real_json_counter}")
-                print(f"✓ File CSV effettivi trovati: {real_csv_counter}")
-                print(f"✓ Totale file trovati: {real_json_counter + real_csv_counter}")
-                
-                if processed_datasets > 0:
-                    print(f"✓ Media file JSON per dataset: {real_json_counter/processed_datasets:.2f}")
-                    print(f"✓ Media file CSV per dataset: {real_csv_counter/processed_datasets:.2f}")
-                
-                # Identifica i dataset con più file
-                top_json_datasets = sorted(
-                    [d for d in cache_data['datasets'].values() if d.get('analyzed', False)],
-                    key=lambda x: len(x.get('json_files', [])), 
-                    reverse=True
-                )[:5]
-                
-                if top_json_datasets:
-                    print("\nTop 5 dataset con più file JSON:")
-                    for i, dataset in enumerate(top_json_datasets, 1):
-                        print(f"{i}. {dataset['url']} - {len(dataset.get('json_files', []))} file JSON")
-                
-            # A questo punto abbiamo una cache aggiornata con tutti i dataset
-            dataset_pages = list(cache_data.get('datasets', {}).keys())
-            total_datasets = len(dataset_pages)
-            
-            # Conteggio file dai dati in cache
-            total_json_files = cache_data.get('total_json_files', 0)
-            if total_json_files == 0:
-                total_json_files = sum(len(dataset_info.get('json_files', [])) for dataset_info in cache_data.get('datasets', {}).values() if dataset_info.get('analyzed', False))
-            
-            total_csv_files = cache_data.get('total_csv_files', 0)
-            if total_csv_files == 0:
-                total_csv_files = sum(len(dataset_info.get('csv_files', [])) for dataset_info in cache_data.get('datasets', {}).values() if dataset_info.get('analyzed', False))
-            
-            # Menu interattivo
-            print("\n=== ANAC Dataset Downloader ===")
-            print(f"Dataset totali: {total_datasets}")
-            print(f"File JSON trovati: {total_json_files}")
-            print(f"File CSV trovati: {total_csv_files}")
-            print("-------------------------")
-            print("1. Scarica file JSON")
-            print("2. Scarica file CSV")
-            print("3. Scarica entrambi")
-            print("4. Riprendi download interrotti")
-            print("5. Mostra statistiche")
-            print("6. Scarica file specifico")
-            print("7. Rigenera cache")
-            print("8. Verifica integrità cache")
-            print("9. Esci")
-            
-            choice = input("\nScegli un'opzione (1-9): ")
-            
-            if choice == "9":
-                return
-            
-            # Opzione per verificare l'integrità della cache
-            if choice == "8":
-                print("\nVerifica dell'integrità della cache in corso...")
-                
-                total_expected = len(cache_data.get('datasets', {}))
-                analyzed_count = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False))
-                error_count = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('error'))
-                missing_json = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False) and not info.get('json_files'))
-                missing_csv = sum(1 for info in cache_data.get('datasets', {}).values() if info.get('analyzed', False) and not info.get('csv_files'))
-                
-                print(f"Dataset totali nella cache: {total_expected}")
-                print(f"Dataset analizzati: {analyzed_count} ({analyzed_count/total_expected*100:.1f}%)")
-                print(f"Dataset con errori: {error_count} ({error_count/total_expected*100:.1f}%)")
-                print(f"Dataset senza file JSON: {missing_json} ({missing_json/analyzed_count*100:.1f}% degli analizzati)")
-                print(f"Dataset senza file CSV: {missing_csv} ({missing_csv/analyzed_count*100:.1f}% degli analizzati)")
-                
-                # Verifica URL duplicati o mancanti
-                all_json_urls = []
-                for info in cache_data.get('datasets', {}).values():
-                    if not info.get('analyzed', False):
+                    except Exception as e:
+                        logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
+                        errored_datasets += 1
                         continue
-                    for file_info in info.get('json_files', []):
-                        all_json_urls.append(file_info.get('url'))
+                else:
+                    skipped_datasets += 1
                 
-                duplicate_urls = {url: count for url, count in collections.Counter(all_json_urls).items() if count > 1}
+                # Aggiorna la cache
+                if cache_data and 'datasets' in cache_data:
+                    # Aggiorna o aggiungi il dataset alla cache
+                    updated = False
+                    for i, cached_dataset in enumerate(cache_data['datasets']):
+                        if cached_dataset['url'] == dataset_url:
+                            cache_data['datasets'][i] = current_dataset_info
+                            updated = True
+                            break
+                    if not updated:
+                        cache_data['datasets'].append(current_dataset_info)
+                else:
+                    cache_data = {'datasets': [current_dataset_info]}
                 
-                if duplicate_urls:
-                    print(f"\nTrovati {len(duplicate_urls)} URL duplicati nei file JSON")
-                    for url, count in list(duplicate_urls.items())[:5]:  # Mostra solo i primi 5
-                        print(f"- {url}: trovato {count} volte")
-                    if len(duplicate_urls) > 5:
-                        print(f"...e altri {len(duplicate_urls) - 5} URL duplicati")
+                # Salva la cache periodicamente
+                if (i + 1) % 10 == 0:
+                    try:
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            json.dump(cache_data, f, indent=2)
+                        logger.logger.info("Cache salvata")
+                    except Exception as e:
+                        logger.logger.error(f"Errore nel salvataggio della cache: {str(e)}")
                 
-                print("\nVerifica completata")
-                input("\nPremi invio per tornare al menu principale...")
-                return
-                
-            # Opzione per rigenerare la cache
-            if choice == "7":
-                print("\nRigenerazione della cache in corso...")
-                # Elimina il file cache esistente
-                if os.path.exists(datasets_cache_file):
-                    os.remove(datasets_cache_file)
-                print("Cache eliminata. Riavvia lo script per generare una nuova cache.")
-                return
-                
-            # Opzione per scaricare un file specifico
-            if choice == "6":
-                print("\n=== Download File Specifico ===")
-                dataset_url = input("Inserisci l'URL del dataset (es. /opendata/dataset/ocds-appalti-ordinari-2022): ")
-                if not dataset_url.startswith('/'):
-                    dataset_url = f"/opendata/dataset/{dataset_url}"
-                
-                file_type = input("Tipo di file (json/csv): ").lower()
-                if file_type not in ["json", "csv"]:
-                    print("Tipo file non valido. Deve essere 'json' o 'csv'.")
-                    return
-                
-                print(f"\nRecupero file {file_type.upper()} dal dataset {dataset_url}...")
-                
-                try:
-                    # Verifica se il dataset è nella cache
-                    if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url]['analyzed']:
-                        files = cache_data['datasets'][dataset_url][f'{file_type}_files']
-                        print(f"Utilizzando dati dalla cache per {dataset_url}")
-                    else:
-                        # Se non è nella cache, recupera i dati direttamente
-                        if file_type == "json":
-                            files = await scraper.get_json_files(dataset_url)
-                        else:
-                            files = await scraper.get_csv_files(dataset_url)
-                    
-                    if not files:
-                        print(f"Nessun file {file_type.upper()} trovato in questo dataset.")
-                        return
-                    
-                    print(f"\nTrovati {len(files)} file {file_type.upper()}:")
-                    for i, file_info in enumerate(files, 1):
-                        print(f"{i}. {file_info['filename']}")
-                    
-                    file_choice = input("\nScegli il numero del file da scaricare (0 per tutti): ")
-                    
-                    if file_choice == "0":
-                        # Scarica tutti i file
-                        for file_info in files:
-                            file_size = await scraper.get_file_size(file_info['url'])
-                            print(f"Dimensione file: {file_size/1024/1024:.1f}MB")
-                            
-                            success = await scraper.download_file(
-                                file_info['url'],
-                                os.path.join(output_dir, file_type, file_info['filename']),
-                                file_size
-                            )
-                            
-                            if success:
-                                print(f"✓ Download completato: {file_info['filename']}")
+                # Aggiorna la tabella di progresso
+                live.update(generate_stats_table())
+        
+        # Salva la cache finale
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2)
+            logger.logger.info("Cache finale salvata")
+        except Exception as e:
+            logger.logger.error(f"Errore nel salvataggio della cache finale: {str(e)}")
+        
+        # Mostra il menu di download
+        print("\nCosa vuoi scaricare?")
+        print("1. File JSON")
+        print("2. File CSV")
+        print("3. Entrambi")
+        print("4. Esci")
+        
+        download_choice = input("\nScelta: ").strip()
+        
+        if download_choice == "4":
+            print("\nOperazione annullata.")
+            return
+        
+        # Inizializza i contatori
+        successful_downloads = 0
+        failed_downloads = 0
+        
+        # Processa i dataset per il download
+        for dataset_info in cache_data['datasets']:
+            if not dataset_info['analyzed']:
+                continue
+            
+            # Scarica i file JSON se richiesto
+            if download_choice in ["1", "3"] and dataset_info['json_files']:
+                for file_info in dataset_info['json_files']:
+                    try:
+                        output_dir = os.path.join('downloads', 'json')
+                        os.makedirs(output_dir, exist_ok=True)
+                        output_file = os.path.join(output_dir, file_info['filename'])
+                        
+                        # Verifica se il file esiste già e ha la dimensione corretta
+                        if os.path.exists(output_file):
+                            current_size = os.path.getsize(output_file)
+                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                successful_downloads += 1
+                                continue
                             else:
-                                print(f"✗ Download fallito: {file_info['filename']}")
-                    else:
+                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                        
+                        # Tenta il download
                         try:
-                            idx = int(file_choice) - 1
-                            if 0 <= idx < len(files):
-                                file_info = files[idx]
-                                file_size = await scraper.get_file_size(file_info['url'])
-                                print(f"Dimensione file: {file_size/1024/1024:.1f}MB")
-                                
-                                # Opzioni avanzate per il download
-                                limit_rate = input("Limite velocità (KB/s, default: 500): ")
-                                limit_rate = int(limit_rate) if limit_rate.isdigit() else 500
-                                
-                                retries = input("Numero di tentativi (default: 5): ")
-                                retries = int(retries) if retries.isdigit() else 5
-                                
-                                print(f"Avvio download di {file_info['filename']} con limite {limit_rate}KB/s e {retries} tentativi...")
-                                
-                                # Imposta le opzioni personalizzate
-                                scraper.download_options = {
-                                    'limit_rate': limit_rate,
-                                    'retries': retries,
-                                }
-                                
-                                success = await scraper.download_file(
-                                    file_info['url'],
-                                    os.path.join(output_dir, file_type, file_info['filename']),
-                                    file_size
-                                )
-                                
-                                if success:
-                                    print(f"✓ Download completato: {file_info['filename']}")
-                                else:
-                                    print(f"✗ Download fallito: {file_info['filename']}")
+                            if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                successful_downloads += 1
+                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
                             else:
-                                print("Scelta non valida.")
-                        except (ValueError, IndexError):
-                            print("Scelta non valida.")
-                except Exception as e:
-                    print(f"Errore durante il recupero dei file: {str(e)}")
-                
-                return
-            
-            # Opzione per mostrate statistiche dettagliate
-            if choice == "5":
-                print("\n=== Statistiche Dettagliate ===")
-                print(f"Dataset totali: {total_datasets}")
-                print(f"File JSON totali: {total_json_files}")
-                print(f"File CSV totali: {total_csv_files}")
-                
-                # Dataset con più file JSON
-                json_leader = max(
-                    ((url, len(info['json_files'])) for url, info in cache_data['datasets'].items() if info['analyzed'] and info['json_files']),
-                    key=lambda x: x[1],
-                    default=('Nessuno', 0)
-                )
-                print(f"\nDataset con più file JSON: {json_leader[0]} ({json_leader[1]} file)")
-                
-                # Dataset con più file CSV
-                csv_leader = max(
-                    ((url, len(info['csv_files'])) for url, info in cache_data['datasets'].items() if info['analyzed'] and info['csv_files']),
-                    key=lambda x: x[1],
-                    default=('Nessuno', 0)
-                )
-                print(f"Dataset con più file CSV: {csv_leader[0]} ({csv_leader[1]} file)")
-                
-                # Media file per dataset
-                json_avg = total_json_files / total_datasets if total_datasets > 0 else 0
-                csv_avg = total_csv_files / total_datasets if total_datasets > 0 else 0
-                print(f"\nMedia file JSON per dataset: {json_avg:.2f}")
-                print(f"Media file CSV per dataset: {csv_avg:.2f}")
-                
-                # Statistiche sui dataset con errori
-                error_datasets = sum(1 for info in cache_data['datasets'].values() if info.get('error'))
-                print(f"\nDataset con errori: {error_datasets} ({error_datasets/total_datasets*100:.1f}%)")
-                
-                input("\nPremi invio per tornare al menu principale...")
-                return
-            
-            # Riutilizziamo la lista di dataset già recuperata
-            if choice in ["1", "2", "3"]:
-                # Statistiche
-                successful_downloads = 0
-                failed_downloads = 0
-                
-                for index, dataset_url in enumerate(dataset_pages, 1):
-                    print(f"\nProcessando dataset {index}/{total_datasets}: {dataset_url}")
-                    
-                    # Verifichiamo se abbiamo i dati nella cache
-                    if dataset_url in cache_data['datasets'] and cache_data['datasets'][dataset_url]['analyzed']:
-                        dataset_info = cache_data['datasets'][dataset_url]
-                        
-                        # Gestione file JSON
-                        if choice in ["1", "3"] and dataset_info['json_files']:
-                            json_files = dataset_info['json_files']
-                            print(f"Trovati {len(json_files)} file JSON nella cache")
-                            
-                            for file_info in json_files:
+                                failed_downloads += 1
+                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                        except Exception as e:
+                            failed_downloads += 1
+                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                            # Se il download fallisce, rimuovi il file incompleto
+                            if os.path.exists(output_file):
                                 try:
-                                    file_size = await scraper.get_file_size(file_info['url'])
-                                    success = await scraper.download_file(
-                                        file_info['url'],
-                                        os.path.join(output_dir, "json", file_info['filename']),
-                                        file_size
-                                    )
-                                    if success:
-                                        successful_downloads += 1
-                                        print(f"✓ Download completato: {file_info['filename']}")
-                                    else:
-                                        failed_downloads += 1
-                                        print(f"✗ Download fallito: {file_info['filename']}")
-                                except Exception as e:
-                                    failed_downloads += 1
-                                    print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                    scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                        
-                        # Gestione file CSV
-                        if choice in ["2", "3"] and dataset_info['csv_files']:
-                            csv_files = dataset_info['csv_files']
-                            print(f"Trovati {len(csv_files)} file CSV nella cache")
-                            
-                            for file_info in csv_files:
-                                try:
-                                    file_size = await scraper.get_file_size(file_info['url'])
-                                    success = await scraper.download_file(
-                                        file_info['url'],
-                                        os.path.join(output_dir, "csv", file_info['filename']),
-                                        file_size
-                                    )
-                                    if success:
-                                        successful_downloads += 1
-                                        print(f"✓ Download completato: {file_info['filename']}")
-                                    else:
-                                        failed_downloads += 1
-                                        print(f"✗ Download fallito: {file_info['filename']}")
-                                except Exception as e:
-                                    failed_downloads += 1
-                                    print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                    scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                    else:
-                        # Se non abbiamo i dati nella cache, li recuperiamo al momento
-                        print(f"Dataset non presente nella cache, recupero dati in tempo reale...")
-                        
-                        # Gestione file JSON
-                        if choice in ["1", "3"]:
-                            try:
-                                json_files = await scraper.get_json_files(dataset_url)
-                                print(f"Trovati {len(json_files)} file JSON")
-                                
-                                for file_info in json_files:
-                                    try:
-                                        file_size = await scraper.get_file_size(file_info['url'])
-                                        success = await scraper.download_file(
-                                            file_info['url'],
-                                            os.path.join(output_dir, "json", file_info['filename']),
-                                            file_size
-                                        )
-                                        if success:
-                                            successful_downloads += 1
-                                            print(f"✓ Download completato: {file_info['filename']}")
-                                        else:
-                                            failed_downloads += 1
-                                            print(f"✗ Download fallito: {file_info['filename']}")
-                                    except Exception as e:
-                                        failed_downloads += 1
-                                        print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                        scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                            except Exception as e:
-                                print(f"✗ Errore nel recupero dei file JSON: {str(e)}")
-                                scraper.logger.logger.error(f"Errore nel recupero dei file JSON da {dataset_url}: {str(e)}")
-                        
-                        # Gestione file CSV
-                        if choice in ["2", "3"]:
-                            try:
-                                csv_files = await scraper.get_csv_files(dataset_url)
-                                print(f"Trovati {len(csv_files)} file CSV")
-                                
-                                for file_info in csv_files:
-                                    try:
-                                        file_size = await scraper.get_file_size(file_info['url'])
-                                        success = await scraper.download_file(
-                                            file_info['url'],
-                                            os.path.join(output_dir, "csv", file_info['filename']),
-                                            file_size
-                                        )
-                                        if success:
-                                            successful_downloads += 1
-                                            print(f"✓ Download completato: {file_info['filename']}")
-                                        else:
-                                            failed_downloads += 1
-                                            print(f"✗ Download fallito: {file_info['filename']}")
-                                    except Exception as e:
-                                        failed_downloads += 1
-                                        print(f"✗ Errore durante il download di {file_info['filename']}: {str(e)}")
-                                        scraper.logger.logger.error(f"Errore nel download di {file_info['filename']}: {str(e)}")
-                            except Exception as e:
-                                print(f"✗ Errore nel recupero dei file CSV: {str(e)}")
-                                scraper.logger.logger.error(f"Errore nel recupero dei file CSV da {dataset_url}: {str(e)}")
-                
-                print("\n=== Riepilogo ===")
-                print(f"Download completati: {successful_downloads}")
-                print(f"Download falliti: {failed_downloads}")
-                print(f"Totale: {successful_downloads + failed_downloads}")
-                return
+                                    os.remove(output_file)
+                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                except:
+                                    pass
+                    except Exception as e:
+                        failed_downloads += 1
+                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
             
-            if choice == "1":
-                # Scarica tutti i file JSON
-                print("\nScaricamento file JSON in corso...")
-                download_dir = os.path.join(output_dir, "json")
-                total_json_to_download = total_json_files
-                json_downloaded = 0
-                json_skipped = 0
-                json_errors = 0
-                
-                # Crea una tabella per lo stato del download
-                def generate_download_table():
-                    table = Table(title="Stato Download File JSON")
-                    table.add_column("Metriche", justify="left", style="cyan")
-                    table.add_column("Valore", justify="right", style="green")
-                    
-                    table.add_row("File Scaricati", f"{json_downloaded}/{total_json_to_download} ({json_downloaded/total_json_to_download*100:.1f}% completato)")
-                    table.add_row("File Saltati (già esistenti)", str(json_skipped))
-                    table.add_row("Errori", str(json_errors))
-                    table.add_row("File Rimanenti", str(total_json_to_download - json_downloaded - json_skipped))
-                    
-                    if json_downloaded > 0:
-                        progress = json_downloaded / total_json_to_download
-                        table.add_row("Barra Progresso", f"[{'=' * int(progress * 40)}{' ' * (40 - int(progress * 40))}] {progress*100:.1f}%")
-                    
-                    return table
-                
-                # Processa tutti i dataset con visualizzazione in tempo reale
-                with Live(generate_download_table(), refresh_per_second=2) as live:
-                    # Iteriamo su tutti i dataset nella cache
-                    for dataset_url, dataset_info in cache_data['datasets'].items():
-                        if not dataset_info.get('analyzed', False):
-                            continue
+            # Scarica i file CSV se richiesto
+            if download_choice in ["2", "3"] and dataset_info['csv_files']:
+                for file_info in dataset_info['csv_files']:
+                    try:
+                        output_dir = os.path.join('downloads', 'csv')
+                        os.makedirs(output_dir, exist_ok=True)
+                        output_file = os.path.join(output_dir, file_info['filename'])
                         
-                        # Estrai i file JSON da questo dataset
-                        for file_info in dataset_info.get('json_files', []):
-                            file_url = file_info.get('url', '')
-                            if not file_url:
+                        # Verifica se il file esiste già e ha la dimensione corretta
+                        if os.path.exists(output_file):
+                            current_size = os.path.getsize(output_file)
+                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                successful_downloads += 1
                                 continue
-                            
-                            # Genera un nome file basato sull'URL
-                            filename = os.path.basename(file_url)
-                            if not filename:
-                                # Se il nome file non può essere estratto, usa l'hash dell'URL
-                                filename = f"file_{hashlib.md5(file_url.encode()).hexdigest()}.json"
-                                
-                            # Se l'URL non termina con .json o .zip, aggiungi l'estensione
-                            if not (filename.lower().endswith('.json') or filename.lower().endswith('.zip')):
-                                filename += '.json'
-                                
-                            output_path = os.path.join(download_dir, filename)
-                            
-                            # Verifica se il file esiste già
-                            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                                json_skipped += 1
-                                live.update(generate_download_table())
-                                continue
-                                
-                            try:
-                                # Ottieni la dimensione del file
-                                file_size = await scraper.get_file_size(file_url)
-                                
-                                # Scarica il file
-                                success = await scraper.download_file(file_url, output_path, file_size)
-                                
-                                if success:
-                                    # Processa il file scaricato (estrai se è uno ZIP)
-                                    await scraper.process_downloaded_file(output_path)
-                                    json_downloaded += 1
-                                else:
-                                    json_errors += 1
-                                    
-                            except Exception as e:
-                                json_errors += 1
-                                scraper.logger.logger.error(f"Errore nel download del file {file_url}: {str(e)}")
-                                
-                            # Aggiorna la visualizzazione
-                            live.update(generate_download_table())
-                
-                print(f"\n✓ Download completato: {json_downloaded} file scaricati, {json_skipped} saltati, {json_errors} errori")
-                return
+                            else:
+                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                        
+                        # Tenta il download
+                        try:
+                            if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                successful_downloads += 1
+                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
+                            else:
+                                failed_downloads += 1
+                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                        except Exception as e:
+                            failed_downloads += 1
+                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                            # Se il download fallisce, rimuovi il file incompleto
+                            if os.path.exists(output_file):
+                                try:
+                                    os.remove(output_file)
+                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                except:
+                                    pass
+                    except Exception as e:
+                        failed_downloads += 1
+                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+        
+        # Mostra il riepilogo finale
+        print("\nRiepilogo Download:")
+        print(f"Download completati con successo: {successful_downloads}")
+        print(f"Download falliti: {failed_downloads}")
     
-    except KeyboardInterrupt:
-        print("\n\nOperazione interrotta dall'utente. I download parziali verranno salvati e potranno essere ripresi in seguito.")
-        print("Esci dal programma e riavvialo selezionando l'opzione 4 per riprendere i download interrotti.")
-    except asyncio.CancelledError:
-        print("\n\nOperazione cancellata. I downloads parziali verranno salvati e potranno essere ripresi in seguito.")
-        print("Esci dal programma e riavvialo selezionando l'opzione 4 per riprendere i download interrotti.")
-    except Exception as e:
-        print(f"\n\nErrore imprevisto: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        print("\nI downloads parziali sono stati salvati e potranno essere ripresi in seguito.")
+    elif choice == "2":
+        # Usa la cache esistente
+        if not cache_data or 'datasets' not in cache_data:
+            print("\nNessuna cache disponibile. Eseguire prima una scansione approfondita.")
+            return
+            
+        print("\nUtilizzo della cache esistente per il download...")
+        print(f"Dataset nella cache: {len(cache_data['datasets'])}")
+        
+        # Mostra il menu di download
+        print("\nCosa vuoi scaricare?")
+        print("1. File JSON")
+        print("2. File CSV")
+        print("3. Entrambi")
+        print("4. Esci")
+        
+        download_choice = input("\nScelta: ").strip()
+        
+        if download_choice == "4":
+            print("\nOperazione annullata.")
+            return
+        
+        # Inizializza i contatori
+        successful_downloads = 0
+        failed_downloads = 0
+        
+        # Inizializza lo scraper
+        async with ANACScraper() as scraper:
+            # Processa i dataset dalla cache
+            for dataset_url, dataset_info in cache_data['datasets'].items():
+                # Scarica i file JSON se richiesto
+                if download_choice in ["1", "3"] and 'json_files' in dataset_info:
+                    for file_info in dataset_info['json_files']:
+                        try:
+                            output_dir = os.path.join('downloads', 'json')
+                            os.makedirs(output_dir, exist_ok=True)
+                            output_file = os.path.join(output_dir, file_info['filename'])
+                            
+                            # Verifica se il file esiste già e ha la dimensione corretta
+                            if os.path.exists(output_file):
+                                current_size = os.path.getsize(output_file)
+                                if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                    logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                    successful_downloads += 1
+                                    continue
+                                else:
+                                    logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                            
+                            # Tenta il download
+                            try:
+                                if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                    successful_downloads += 1
+                                    logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
+                                else:
+                                    failed_downloads += 1
+                                    logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                            except Exception as e:
+                                failed_downloads += 1
+                                logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                                # Se il download fallisce, rimuovi il file incompleto
+                                if os.path.exists(output_file):
+                                    try:
+                                        os.remove(output_file)
+                                        logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                    except:
+                                        pass
+                        except Exception as e:
+                            failed_downloads += 1
+                            logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+                
+                # Scarica i file CSV se richiesto
+                if download_choice in ["2", "3"] and 'csv_files' in dataset_info:
+                    for file_info in dataset_info['csv_files']:
+                        try:
+                            output_dir = os.path.join('downloads', 'csv')
+                            os.makedirs(output_dir, exist_ok=True)
+                            output_file = os.path.join(output_dir, file_info['filename'])
+                            
+                            # Verifica se il file esiste già e ha la dimensione corretta
+                            if os.path.exists(output_file):
+                                current_size = os.path.getsize(output_file)
+                                if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                    logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                    successful_downloads += 1
+                                    continue
+                                else:
+                                    logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                            
+                            # Tenta il download
+                            try:
+                                if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                    successful_downloads += 1
+                                    logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
+                                else:
+                                    failed_downloads += 1
+                                    logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                            except Exception as e:
+                                failed_downloads += 1
+                                logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                                # Se il download fallisce, rimuovi il file incompleto
+                                if os.path.exists(output_file):
+                                    try:
+                                        os.remove(output_file)
+                                        logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                    except:
+                                        pass
+                        except Exception as e:
+                            failed_downloads += 1
+                            logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+        
+        # Mostra il riepilogo finale
+        print("\nRiepilogo Download:")
+        print(f"Download completati con successo: {successful_downloads}")
+        print(f"Download falliti: {failed_downloads}")
+        
+    else:
+        print("\nOperazione annullata.")
+        return
 
 if __name__ == "__main__":
     asyncio.run(main()) 

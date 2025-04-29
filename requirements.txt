@@ -1,8 +1,8 @@
-aiohttp==3.11.16
-beautifulsoup4==4.13.3
+aiohttp>=3.8.0
+beautifulsoup4>=4.9.3
 bs4==0.0.2
 asyncio==3.4.3
-rich==14.0.0
+rich>=10.0.0
 requests==2.32.3
 certifi==2025.1.31
 charset-normalizer==3.4.1
