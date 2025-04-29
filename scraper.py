@@ -193,6 +193,20 @@ class AdvancedLogger:
             message
         )
 
+    def info(self, message: str):
+        """Log di un messaggio informativo"""
+        self.logger.info(message)
+        self._log_to_detailed_file(
+            "INFO",
+            "",
+            "",
+            0,
+            "INFO",
+            0,
+            0,
+            message
+        )
+
 class RateLimiter:
     def __init__(self, calls_per_second=1):
         self.calls_per_second = calls_per_second
@@ -750,8 +764,18 @@ class ANACScraper:
             # Crea la directory se non esiste
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
-            # Dimensione di ogni segmento (1MB)
-            segment_size = 1 * 1024 * 1024
+            # Dimensione iniziale del segmento basata sulla dimensione totale del file
+            if file_size < 100 * 1024 * 1024:  # < 100MB
+                initial_segment_size = 5 * 1024 * 1024  # 5MB
+            elif file_size < 1024 * 1024 * 1024:  # < 1GB
+                initial_segment_size = 10 * 1024 * 1024  # 10MB
+            else:  # >= 1GB
+                initial_segment_size = 20 * 1024 * 1024  # 20MB
+                
+            # Dimensione minima e massima del segmento
+            min_segment_size = 1 * 1024 * 1024  # 1MB
+            max_segment_size = 50 * 1024 * 1024  # 50MB
+            current_segment_size = min(initial_segment_size, max_segment_size)
             
             # Nome file temporaneo per il download parziale
             temp_file = output_file + ".part"
@@ -760,13 +784,13 @@ class ANACScraper:
             start_position = 0
             if os.path.exists(temp_file):
                 start_position = os.path.getsize(temp_file)
-                self.logger.logger.info(f"Trovato download parziale: {start_position/(1024*1024):.1f}MB, riprendo da lì")
+                self.logger.info(f"Trovato download parziale: {start_position/(1024*1024):.1f}MB, riprendo da lì")
             
             # Calcola quanti segmenti devono essere scaricati
-            total_segments = math.ceil(file_size / segment_size)
-            start_segment = start_position // segment_size
+            total_segments = math.ceil(file_size / current_segment_size)
+            start_segment = start_position // current_segment_size
             
-            self.logger.logger.info(f"Download segmentato per {os.path.basename(output_file)} ({file_size/(1024*1024):.1f}MB) - {total_segments} segmenti totali")
+            self.logger.info(f"Download segmentato per {os.path.basename(output_file)} ({file_size/(1024*1024):.1f}MB) - {total_segments} segmenti totali da {current_segment_size/(1024*1024):.1f}MB")
             
             # Salva l'informazione nei download parziali
             filename = os.path.basename(output_file)
@@ -786,13 +810,13 @@ class ANACScraper:
                 # Scarica i segmenti rimanenti
                 for segment_idx in range(start_segment, total_segments):
                     # Calcola i byte di inizio e fine per questo segmento
-                    segment_start = segment_idx * segment_size
-                    segment_end = min(segment_start + segment_size - 1, file_size - 1)
+                    segment_start = segment_idx * current_segment_size
+                    segment_end = min(segment_start + current_segment_size - 1, file_size - 1)
                     
                     # Massimo 5 tentativi per segmento
                     for attempt in range(5):
                         try:
-                            self.logger.logger.info(f"Scarico segmento {segment_idx+1}/{total_segments} (byte {segment_start}-{segment_end})")
+                            self.logger.info(f"Scarico segmento {segment_idx+1}/{total_segments} (byte {segment_start}-{segment_end})")
                             
                             # Applica rate limiting
                             await self.rate_limiter.acquire()
@@ -805,10 +829,18 @@ class ANACScraper:
                             # Effettua la richiesta
                             async with self.session.get(url, headers=headers, timeout=self.timeout, cookies=self.cookies) as response:
                                 if response.status not in (200, 206):  # 206 = Partial Content
-                                    self.logger.logger.error(f"Risposta non valida ({response.status}) per il segmento {segment_idx+1}")
+                                    self.logger.error(f"Risposta non valida ({response.status}) per il segmento {segment_idx+1}")
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
+                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
+                                    if current_segment_size > min_segment_size:
+                                        current_segment_size = max(current_segment_size // 2, min_segment_size)
+                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                        # Ricalcola i segmenti rimanenti
+                                        total_segments = math.ceil((file_size - segment_start) / current_segment_size)
+                                        segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                        break
                                     return False
                                 
                                 # Leggi i dati di questo segmento
@@ -816,10 +848,18 @@ class ANACScraper:
                                 expected_size = segment_end - segment_start + 1
                                 
                                 if len(data) != expected_size:
-                                    self.logger.logger.warning(f"Dimensioni segmento non corrispondono: previsto {expected_size}, ricevuto {len(data)}")
+                                    self.logger.warning(f"Dimensioni segmento non corrispondono: previsto {expected_size}, ricevuto {len(data)}")
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
+                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
+                                    if current_segment_size > min_segment_size:
+                                        current_segment_size = max(current_segment_size // 2, min_segment_size)
+                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                        # Ricalcola i segmenti rimanenti
+                                        total_segments = math.ceil((file_size - segment_start) / current_segment_size)
+                                        segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                        break
                                 
                                 # Scrivi i dati nel file e va avanti
                                 f.write(data)
@@ -832,22 +872,47 @@ class ANACScraper:
                                 self.download_state['partial_downloads'][filename]['last_update'] = datetime.now().isoformat()
                                 self.save_state()
                                 
-                                self.logger.logger.info(f"Progresso: {current_size/(1024*1024):.1f}MB / {file_size/(1024*1024):.1f}MB ({percentage:.1f}%)")
+                                self.logger.info(f"Progresso: {current_size/(1024*1024):.1f}MB / {file_size/(1024*1024):.1f}MB ({percentage:.1f}%)")
+                                
+                                # Se il download è riuscito, prova ad aumentare la dimensione del segmento
+                                if current_segment_size < initial_segment_size:
+                                    new_segment_size = min(current_segment_size * 2, initial_segment_size)
+                                    if new_segment_size > current_segment_size:
+                                        current_segment_size = new_segment_size
+                                        self.logger.info(f"Aumento dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                        # Ricalcola i segmenti rimanenti
+                                        total_segments = math.ceil((file_size - current_size) / current_segment_size)
                                 
                                 # Successo per questo segmento, interrompi il ciclo di tentativi
                                 break
                                 
                         except asyncio.TimeoutError:
-                            self.logger.logger.warning(f"Timeout durante il download del segmento {segment_idx+1}")
+                            self.logger.warning(f"Timeout durante il download del segmento {segment_idx+1}")
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
+                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
+                            if current_segment_size > min_segment_size:
+                                current_segment_size = max(current_segment_size // 2, min_segment_size)
+                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                # Ricalcola i segmenti rimanenti
+                                total_segments = math.ceil((file_size - segment_start) / current_segment_size)
+                                segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                break
                             return False
                         except Exception as e:
-                            self.logger.logger.error(f"Errore durante il download del segmento {segment_idx+1}: {str(e)}")
+                            self.logger.error(f"Errore durante il download del segmento {segment_idx+1}: {str(e)}")
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
+                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
+                            if current_segment_size > min_segment_size:
+                                current_segment_size = max(current_segment_size // 2, min_segment_size)
+                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                # Ricalcola i segmenti rimanenti
+                                total_segments = math.ceil((file_size - segment_start) / current_segment_size)
+                                segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                break
                             return False
             
             # Verifica dimensione finale
@@ -857,14 +922,14 @@ class ANACScraper:
                     # Verifica se il file di destinazione esiste già
                     if os.path.exists(output_file):
                         try:
-                            self.logger.logger.info(f"Il file {output_file} esiste già. Tentativo di rimozione...")
+                            self.logger.info(f"Il file {output_file} esiste già. Tentativo di rimozione...")
                             os.remove(output_file)
                         except Exception as e:
-                            self.logger.logger.error(f"Impossibile rimuovere il file esistente: {str(e)}")
+                            self.logger.error(f"Impossibile rimuovere il file esistente: {str(e)}")
                             # Se non possiamo rimuovere il file esistente, rinomina il file temporaneo con un altro nome
                             alternative_output = output_file + ".new"
                             os.rename(temp_file, alternative_output)
-                            self.logger.logger.info(f"File rinominato come {alternative_output} invece di {output_file}")
+                            self.logger.info(f"File rinominato come {alternative_output} invece di {output_file}")
                             output_file = alternative_output
                     
                     try:
@@ -881,266 +946,20 @@ class ANACScraper:
                             self.download_state['failed_files'].remove(filename)
                         self.save_state()
                         
-                        self.logger.logger.info(f"Download completato: {os.path.basename(output_file)}")
+                        self.logger.info(f"Download completato: {os.path.basename(output_file)}")
                         return True
                     except Exception as e:
-                        self.logger.logger.error(f"Errore nel rinominare il file temporaneo: {str(e)}")
+                        self.logger.error(f"Errore nel rinominare il file temporaneo: {str(e)}")
                         return False
                 else:
-                    self.logger.logger.error(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
+                    self.logger.error(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
             
             return False
             
         except Exception as e:
-            self.logger.logger.error(f"Errore nel download a segmenti: {str(e)}")
+            self.logger.error(f"Errore nel download a segmenti: {str(e)}")
             return False
 
-    async def _download_segment_conservative(self, url, segment_file, start_byte, end_byte, segment_idx):
-        """Download a segment using a dynamic approach that starts aggressive and becomes conservative on errors."""
-        self.logger.logger.info(f"\n{'='*80}")
-        self.logger.logger.info(f"Avvio download per segmento {segment_idx+1}")
-        self.logger.logger.info(f"File: {os.path.basename(segment_file)}")
-        self.logger.logger.info(f"URL: {url}")
-        
-        # Calcola la dimensione totale del segmento
-        total_bytes = end_byte - start_byte + 1
-        
-        # Calcola la dimensione iniziale del chunk in base alla dimensione totale
-        if total_bytes < 100 * 1024 * 1024:  # < 100MB
-            initial_chunk_size = 5 * 1024 * 1024  # 5MB
-        elif total_bytes < 1024 * 1024 * 1024:  # < 1GB
-            initial_chunk_size = 10 * 1024 * 1024  # 10MB
-        else:  # >= 1GB
-            initial_chunk_size = 20 * 1024 * 1024  # 20MB
-            
-        # Chunk size minimo (1MB) e massimo (50MB)
-        min_chunk_size = 1 * 1024 * 1024  # 1MB
-        max_chunk_size = 50 * 1024 * 1024  # 50MB
-        current_chunk_size = min(initial_chunk_size, max_chunk_size)
-        
-        # Ensure segment directory exists
-        os.makedirs(os.path.dirname(segment_file), exist_ok=True)
-        
-        # Initialize file if it doesn't exist
-        if not os.path.exists(segment_file):
-            with open(segment_file, 'wb') as f:
-                pass
-        
-        # Get current file size
-        current_size = os.path.getsize(segment_file)
-        if current_size > 0:
-            start_byte += current_size
-            self.logger.logger.info(f"Riprendo download da {current_size/(1024*1024):.1f}MB")
-        
-        # Check if already complete
-        if start_byte >= end_byte:
-            self.logger.logger.info(f"Segmento {segment_idx+1} già completo")
-            return True
-        
-        # Calculate number of chunks
-        total_bytes = end_byte - start_byte + 1
-        num_chunks = math.ceil(total_bytes / current_chunk_size)
-        
-        self.logger.logger.info(f"\nStatistiche iniziali:")
-        self.logger.logger.info(f"Dimensione totale: {total_bytes/(1024*1024):.1f}MB")
-        self.logger.logger.info(f"Numero di chunk: {num_chunks}")
-        self.logger.logger.info(f"Dimensione chunk iniziale: {current_chunk_size/(1024*1024):.1f}MB")
-        self.logger.logger.info(f"Rate limit: {self.download_options.get('limit_rate', 200)}KB/s")
-        self.logger.logger.info(f"{'='*80}\n")
-        
-        # Start download
-        current_byte = start_byte
-        mode = 'ab'  # Always append
-        consecutive_errors = 0  # Contatore errori consecutivi
-        max_consecutive_errors = 3  # Dopo 3 errori consecutivi, riduci la dimensione del chunk
-        
-        # Variabili per il calcolo della velocità
-        last_chunk_time = time.time()
-        last_chunk_size = 0
-        total_downloaded = 0
-        start_time = time.time()
-        
-        while current_byte <= end_byte:
-            chunk_start = current_byte
-            chunk_end = min(chunk_start + current_chunk_size - 1, end_byte)
-            
-            # Calcola il progresso
-            progress = (current_byte - start_byte) / (end_byte - start_byte + 1) * 100
-            current_chunk = (current_byte - start_byte) // current_chunk_size + 1
-            
-            self.logger.logger.info(f"\nChunk {current_chunk}/{num_chunks} ({progress:.1f}%)")
-            self.logger.logger.info(f"Bytes: {chunk_start}-{chunk_end}")
-            self.logger.logger.info(f"Chunk size: {current_chunk_size/(1024*1024):.1f}MB")
-            self.logger.logger.info(f"Consecutive errors: {consecutive_errors}")
-            
-            # Calcola il delay in base agli errori consecutivi
-            if consecutive_errors > 0:
-                delay = min(5 * (2 ** consecutive_errors), 30)  # Max 30 secondi
-                self.logger.logger.info(f"Attesa di {delay}s prima del tentativo (errori consecutivi: {consecutive_errors})")
-                await asyncio.sleep(delay)
-            else:
-                # Delay minimo tra i chunks quando non ci sono errori
-                delay = random.uniform(1, 3)
-                await asyncio.sleep(delay)
-            
-            # Try up to 3 times for each chunk
-            for attempt in range(3):
-                try:
-                    # Prepare headers with range
-                    headers = self.headers.copy()
-                    headers['Range'] = f'bytes={chunk_start}-{chunk_end}'
-                    
-                    # Rate limit
-                    limit_rate = self.download_options.get('limit_rate', 200)
-                    
-                    # Use curl for each chunk if available
-                    if self.curl_available:
-                        chunk_start_time = time.time()
-                        success = await self._download_chunk_with_curl(url, segment_file, chunk_start, chunk_end, segment_idx, attempt, limit_rate, mode)
-                        if success:
-                            chunk_end_time = time.time()
-                            chunk_duration = chunk_end_time - chunk_start_time
-                            chunk_size = chunk_end - chunk_start + 1
-                            speed = (chunk_size / chunk_duration) / (1024 * 1024)  # MB/s
-                            
-                            current_byte = chunk_end + 1
-                            total_downloaded += chunk_size
-                            consecutive_errors = 0  # Reset error counter on success
-                            
-                            # Calcola ETA
-                            remaining_bytes = end_byte - current_byte + 1
-                            if speed > 0:
-                                eta = remaining_bytes / (speed * 1024 * 1024)  # secondi
-                                eta_str = f"{int(eta//60)}m {int(eta%60)}s"
-                            else:
-                                eta_str = "N/A"
-                            
-                            self.logger.logger.info(f"\nStatistiche chunk:")
-                            self.logger.logger.info(f"Velocità: {speed:.2f} MB/s")
-                            self.logger.logger.info(f"Tempo impiegato: {chunk_duration:.1f}s")
-                            self.logger.logger.info(f"ETA: {eta_str}")
-                            self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
-                            
-                            # Se abbiamo ridotto il chunk size e ora funziona, prova ad aumentarlo
-                            if current_chunk_size < initial_chunk_size:
-                                current_chunk_size = min(current_chunk_size * 2, initial_chunk_size)
-                                self.logger.logger.info(f"Download riuscito, aumento chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                            break  # Success, move to next chunk
-                        elif attempt == 2:  # Last attempt failed
-                            self.logger.logger.error(f"Chunk fallito dopo 3 tentativi")
-                            consecutive_errors += 1
-                            # Riduci la dimensione del chunk se possibile
-                            if current_chunk_size > min_chunk_size:
-                                current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
-                                self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                                break  # Riprova con chunk più piccolo
-                            return False
-                    else:
-                        # Use aiohttp fallback
-                        timeout = aiohttp.ClientTimeout(total=600)  # 10 minutes per chunk
-                        
-                        chunk_start_time = time.time()
-                        async with self.session.get(url, headers=headers, timeout=timeout) as response:
-                            if response.status not in (200, 206):
-                                self.logger.logger.error(f"Errore HTTP {response.status}")
-                                if attempt == 2:  # Last attempt
-                                    consecutive_errors += 1
-                                    if current_chunk_size > min_chunk_size:
-                                        current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
-                                        self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                                        break  # Riprova con chunk più piccolo
-                                    return False
-                                continue  # Try again
-                            
-                            data = await response.read()
-                            
-                            # Verify data size
-                            expected_size = chunk_end - chunk_start + 1
-                            if len(data) != expected_size:
-                                self.logger.logger.error(f"Dimensione data non corretta: atteso {expected_size}, ricevuto {len(data)}")
-                                if attempt == 2:  # Last attempt
-                                    consecutive_errors += 1
-                                    if current_chunk_size > min_chunk_size:
-                                        current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
-                                        self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                                        break  # Riprova con chunk più piccolo
-                                    return False
-                                continue  # Try again
-                            
-                            # Write data
-                            with open(segment_file, mode) as f:
-                                f.seek(current_byte - start_byte)  # Position in file
-                                f.write(data)
-                            
-                            chunk_end_time = time.time()
-                            chunk_duration = chunk_end_time - chunk_start_time
-                            chunk_size = len(data)
-                            speed = (chunk_size / chunk_duration) / (1024 * 1024)  # MB/s
-                            
-                            current_byte = chunk_end + 1
-                            total_downloaded += chunk_size
-                            consecutive_errors = 0  # Reset error counter on success
-                            
-                            # Calcola ETA
-                            remaining_bytes = end_byte - current_byte + 1
-                            if speed > 0:
-                                eta = remaining_bytes / (speed * 1024 * 1024)  # secondi
-                                eta_str = f"{int(eta//60)}m {int(eta%60)}s"
-                            else:
-                                eta_str = "N/A"
-                            
-                            self.logger.logger.info(f"\nStatistiche chunk:")
-                            self.logger.logger.info(f"Velocità: {speed:.2f} MB/s")
-                            self.logger.logger.info(f"Tempo impiegato: {chunk_duration:.1f}s")
-                            self.logger.logger.info(f"ETA: {eta_str}")
-                            self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
-                            
-                            # Se abbiamo ridotto il chunk size e ora funziona, prova ad aumentarlo
-                            if current_chunk_size < initial_chunk_size:
-                                current_chunk_size = min(current_chunk_size * 2, initial_chunk_size)
-                                self.logger.logger.info(f"Download riuscito, aumento chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                            break  # Success, move to next chunk
-                except Exception as e:
-                    self.logger.logger.error(f"Errore durante download: {str(e)}")
-                    if attempt == 2:  # Last attempt
-                        consecutive_errors += 1
-                        if current_chunk_size > min_chunk_size:
-                            current_chunk_size = max(current_chunk_size // 2, min_chunk_size)
-                            self.logger.logger.info(f"Riduco chunk size a {current_chunk_size/1024/1024:.1f}MB")
-                            break  # Riprova con chunk più piccolo
-                        return False
-            
-            # Se abbiamo troppi errori consecutivi, diventa più conservativo
-            if consecutive_errors >= max_consecutive_errors:
-                self.logger.logger.warning(f"Troppi errori consecutivi ({consecutive_errors}). Divento più conservativo...")
-                await asyncio.sleep(30)  # Attesa più lunga
-                consecutive_errors = 0  # Reset dopo l'attesa
-        
-        # Calcola statistiche finali
-        total_time = time.time() - start_time
-        avg_speed = (total_downloaded / total_time) / (1024 * 1024)  # MB/s
-        
-        self.logger.logger.info(f"\n{'='*80}")
-        self.logger.logger.info(f"Statistiche finali:")
-        self.logger.logger.info(f"Tempo totale: {total_time:.1f}s")
-        self.logger.logger.info(f"Velocità media: {avg_speed:.2f} MB/s")
-        self.logger.logger.info(f"Totale scaricato: {total_downloaded/(1024*1024):.1f}MB")
-        self.logger.logger.info(f"{'='*80}\n")
-        
-        # Verify final segment size
-        if os.path.exists(segment_file):
-            final_size = os.path.getsize(segment_file)
-            expected_size = end_byte - start_byte + 1 + current_size  # Include existing data
-            
-            if abs(final_size - expected_size) <= 1024:  # Allow 1KB difference
-                self.logger.logger.info(f"✓ Segmento {segment_idx+1} completato: {final_size/(1024*1024):.1f}MB")
-                return True
-            else:
-                self.logger.logger.error(f"✗ Dimensione segmento non corrisponde: atteso {expected_size/(1024*1024):.1f}MB, ottenuto {final_size/(1024*1024):.1f}MB")
-                return False
-        
-        return False
-    
     async def _download_chunk_with_curl(self, url, output_file, start_byte, end_byte, segment_idx, chunk_idx, limit_rate, mode='ab'):
         """Download a small chunk using curl with very restrictive parameters."""
         try:
