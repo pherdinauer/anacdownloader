@@ -1642,9 +1642,40 @@ async def main():
         logger = AdvancedLogger()
         
         # Scansiona i file esistenti
+        print("\n=== SCANSIONE FILE ESISTENTI ===")
+        print("Scansione directory JSON...")
         logger.info("Scansione dei file esistenti...")
-        existing_json_files = scan_existing_files('downloads/json')
-        existing_csv_files = scan_existing_files('downloads/csv')
+        
+        # Usa rich per mostrare una barra di progresso
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            # Task per la scansione JSON
+            json_task = progress.add_task("[cyan]Scansione file JSON...", total=None)
+            
+            # Scansiona i file JSON
+            existing_json_files = scan_existing_files('downloads/json')
+            progress.update(json_task, completed=True, description="[green]Scansione JSON completata")
+            
+            # Task per la scansione CSV
+            csv_task = progress.add_task("[cyan]Scansione file CSV...", total=None)
+            
+            # Scansiona i file CSV
+            existing_csv_files = scan_existing_files('downloads/csv')
+            progress.update(csv_task, completed=True, description="[green]Scansione CSV completata")
+        
+        # Mostra il riepilogo
+        print("\n=== RIEPILOGO FILE TROVATI ===")
+        print(f"File JSON trovati: {len(existing_json_files)}")
+        print(f"File CSV trovati: {len(existing_csv_files)}")
+        print("=" * 30)
+        
         logger.info(f"Trovati {len(existing_json_files)} file JSON e {len(existing_csv_files)} file CSV esistenti")
         
         # Carica o crea il file di cache
