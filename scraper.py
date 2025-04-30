@@ -1564,6 +1564,19 @@ def save_crash_report(error, traceback_info, cache_data=None):
         print("Traceback originale:")
         print(traceback_info)
 
+def scan_existing_files(download_dir: str) -> Dict[str, int]:
+    """Scansiona i file esistenti nella directory di download e restituisce un dizionario con i nomi dei file e le loro dimensioni."""
+    existing_files = {}
+    try:
+        if os.path.exists(download_dir):
+            for filename in os.listdir(download_dir):
+                file_path = os.path.join(download_dir, filename)
+                if os.path.isfile(file_path):
+                    existing_files[filename] = os.path.getsize(file_path)
+    except Exception as e:
+        logger.error(f"Errore nella scansione dei file esistenti: {str(e)}")
+    return existing_files
+
 async def main():
     """Funzione principale per il download dei dataset."""
     cache_data = None
@@ -1574,6 +1587,12 @@ async def main():
         
         # Inizializza il logger
         logger = AdvancedLogger()
+        
+        # Scansiona i file esistenti
+        logger.logger.info("Scansione dei file esistenti...")
+        existing_json_files = scan_existing_files('downloads/json')
+        existing_csv_files = scan_existing_files('downloads/csv')
+        logger.logger.info(f"Trovati {len(existing_json_files)} file JSON e {len(existing_csv_files)} file CSV esistenti")
         
         # Carica o crea il file di cache
         cache_file = 'datasets_cache.json'
@@ -1777,8 +1796,8 @@ async def main():
                         output_file = os.path.join(output_dir, file_info['filename'])
                         
                         # Verifica se il file esiste già e ha la dimensione corretta
-                        if os.path.exists(output_file):
-                            current_size = os.path.getsize(output_file)
+                        if file_info['filename'] in existing_json_files:
+                            current_size = existing_json_files[file_info['filename']]
                             if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
                                 logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
                                 successful_downloads += 1
@@ -1878,8 +1897,8 @@ async def main():
                         output_file = os.path.join(output_dir, file_info['filename'])
                         
                         # Verifica se il file esiste già e ha la dimensione corretta
-                        if os.path.exists(output_file):
-                            current_size = os.path.getsize(output_file)
+                        if file_info['filename'] in existing_json_files:
+                            current_size = existing_json_files[file_info['filename']]
                             if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
                                 logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
                                 successful_downloads += 1
