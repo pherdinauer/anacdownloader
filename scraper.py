@@ -1564,18 +1564,71 @@ def save_crash_report(error, traceback_info, cache_data=None):
         print("Traceback originale:")
         print(traceback_info)
 
-def scan_existing_files(download_dir: str) -> Dict[str, int]:
-    """Scansiona i file esistenti nella directory di download e restituisce un dizionario con i nomi dei file e le loro dimensioni."""
+def calculate_file_hash(file_path: str) -> str:
+    """Calcola l'hash SHA256 di un file."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            # Leggi il file a blocchi per gestire file grandi
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.error(f"Errore nel calcolo dell'hash del file {file_path}: {str(e)}")
+        return ""
+
+def scan_existing_files(download_dir: str) -> Dict[str, Dict[str, any]]:
+    """Scansiona i file esistenti nella directory di download e restituisce un dizionario con i nomi dei file e le loro informazioni."""
     existing_files = {}
     try:
         if os.path.exists(download_dir):
             for filename in os.listdir(download_dir):
                 file_path = os.path.join(download_dir, filename)
                 if os.path.isfile(file_path):
-                    existing_files[filename] = os.path.getsize(file_path)
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        file_hash = calculate_file_hash(file_path)
+                        existing_files[filename] = {
+                            'size': file_size,
+                            'hash': file_hash,
+                            'path': file_path
+                        }
+                    except Exception as e:
+                        logger.error(f"Errore nella scansione del file {filename}: {str(e)}")
+                        continue
     except Exception as e:
         logger.error(f"Errore nella scansione dei file esistenti: {str(e)}")
     return existing_files
+
+async def verify_file_integrity(file_path: str, expected_size: int) -> bool:
+    """Verifica l'integrità di un file."""
+    try:
+        # Verifica dimensione
+        if not os.path.exists(file_path):
+            return False
+            
+        actual_size = os.path.getsize(file_path)
+        if abs(actual_size - expected_size) > 1024:  # Tollera 1KB di differenza
+            logger.warning(f"Dimensione file non corrispondente. Prevista: {expected_size}, Attuale: {actual_size}")
+            return False
+            
+        # Verifica che il file non sia corrotto
+        # Per file JSON, verifica che sia un JSON valido
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                # Leggi solo i primi 1000 caratteri per verificare il formato
+                content = f.read(1000)
+                if not content.strip().startswith('{') and not content.strip().startswith('['):
+                    logger.warning(f"File non sembra essere un JSON valido: {file_path}")
+                    return False
+        except Exception as e:
+            logger.error(f"Errore nella verifica del formato JSON: {str(e)}")
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"Errore nella verifica dell'integrità del file {file_path}: {str(e)}")
+        return False
 
 async def main():
     """Funzione principale per il download dei dataset."""
@@ -1589,10 +1642,10 @@ async def main():
         logger = AdvancedLogger()
         
         # Scansiona i file esistenti
-        logger.logger.info("Scansione dei file esistenti...")
+        logger.info("Scansione dei file esistenti...")
         existing_json_files = scan_existing_files('downloads/json')
         existing_csv_files = scan_existing_files('downloads/csv')
-        logger.logger.info(f"Trovati {len(existing_json_files)} file JSON e {len(existing_csv_files)} file CSV esistenti")
+        logger.info(f"Trovati {len(existing_json_files)} file JSON e {len(existing_csv_files)} file CSV esistenti")
         
         # Carica o crea il file di cache
         cache_file = 'datasets_cache.json'
@@ -1601,29 +1654,29 @@ async def main():
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
-                logger.logger.info("Cache caricata con successo")
+                logger.info("Cache caricata con successo")
             except Exception as e:
-                logger.logger.error(f"Errore nel caricamento della cache: {str(e)}")
+                logger.error(f"Errore nel caricamento della cache: {str(e)}")
                 cache_data = {}
         
         # Verifica se la cache è valida
         is_cache_valid = False
         if cache_data and 'datasets' in cache_data:
             is_cache_valid = True
-            logger.logger.info(f"Cache valida con {len(cache_data['datasets'])} dataset")
+            logger.info(f"Cache valida con {len(cache_data['datasets'])} dataset")
         
         # Se la cache non è valida, recupera la lista dei dataset
         if not is_cache_valid:
-            logger.logger.info("Cache non valida o non presente, recupero lista dataset...")
+            logger.info("Cache non valida o non presente, recupero lista dataset...")
             dataset_pages = await get_dataset_pages()
             if not dataset_pages:
-                logger.logger.error("Impossibile recuperare la lista dei dataset")
+                logger.error("Impossibile recuperare la lista dei dataset")
                 return
-            logger.logger.info(f"Trovati {len(dataset_pages)} dataset")
+            logger.info(f"Trovati {len(dataset_pages)} dataset")
         else:
             # La cache usa un dizionario dove le chiavi sono gli URL dei dataset
             dataset_pages = list(cache_data['datasets'].keys())
-            logger.logger.info(f"Utilizzo {len(dataset_pages)} dataset dalla cache")
+            logger.info(f"Utilizzo {len(dataset_pages)} dataset dalla cache")
         
         # Chiedi all'utente cosa vuole fare
         print("\nCosa vuoi fare?")
@@ -1797,13 +1850,19 @@ async def main():
                         
                         # Verifica se il file esiste già e ha la dimensione corretta
                         if file_info['filename'] in existing_json_files:
-                            current_size = existing_json_files[file_info['filename']]
-                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                            file_data = existing_json_files[file_info['filename']]
+                            if await verify_file_integrity(file_data['path'], file_info['size']):
+                                logger.info(f"File già esistente e integro: {file_info['filename']}")
                                 successful_downloads += 1
                                 continue
                             else:
-                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                                logger.info(f"File esistente ma incompleto o corrotto, riprovo il download: {file_info['filename']}")
+                                # Rimuovi il file corrotto prima di riprovare il download
+                                try:
+                                    os.remove(file_data['path'])
+                                    logger.info(f"Rimosso file corrotto: {file_info['filename']}")
+                                except Exception as e:
+                                    logger.error(f"Errore nella rimozione del file corrotto: {str(e)}")
                         
                         # Tenta il download
                         try:
@@ -1898,13 +1957,19 @@ async def main():
                         
                         # Verifica se il file esiste già e ha la dimensione corretta
                         if file_info['filename'] in existing_json_files:
-                            current_size = existing_json_files[file_info['filename']]
-                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                            file_data = existing_json_files[file_info['filename']]
+                            if await verify_file_integrity(file_data['path'], file_info['size']):
+                                logger.info(f"File già esistente e integro: {file_info['filename']}")
                                 successful_downloads += 1
                                 continue
                             else:
-                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                                logger.info(f"File esistente ma incompleto o corrotto, riprovo il download: {file_info['filename']}")
+                                # Rimuovi il file corrotto prima di riprovare il download
+                                try:
+                                    os.remove(file_data['path'])
+                                    logger.info(f"Rimosso file corrotto: {file_info['filename']}")
+                                except Exception as e:
+                                    logger.error(f"Errore nella rimozione del file corrotto: {str(e)}")
                         
                         # Tenta il download
                         try:
