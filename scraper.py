@@ -1582,22 +1582,37 @@ def scan_existing_files(download_dir: str) -> Dict[str, Dict[str, any]]:
     existing_files = {}
     try:
         if os.path.exists(download_dir):
-            for filename in os.listdir(download_dir):
+            # Ottieni la lista dei file
+            files = os.listdir(download_dir)
+            total_files = len(files)
+            print(f"\nTrovati {total_files} file da scansionare in {download_dir}")
+            
+            # Scansiona ogni file
+            for i, filename in enumerate(files, 1):
                 file_path = os.path.join(download_dir, filename)
                 if os.path.isfile(file_path):
                     try:
+                        print(f"[{i}/{total_files}] Scansione file: {filename}")
                         file_size = os.path.getsize(file_path)
+                        print(f"  Dimensione: {file_size/1024/1024:.2f} MB")
+                        
+                        print("  Calcolo hash...", end="", flush=True)
                         file_hash = calculate_file_hash(file_path)
+                        print(" completato")
+                        
                         existing_files[filename] = {
                             'size': file_size,
                             'hash': file_hash,
                             'path': file_path
                         }
+                        print(f"  File aggiunto al catalogo: {filename}\n")
                     except Exception as e:
-                        logger.error(f"Errore nella scansione del file {filename}: {str(e)}")
+                        print(f"\n  [ERRORE] Errore nella scansione del file {filename}: {str(e)}")
                         continue
+        else:
+            print(f"\nLa directory {download_dir} non esiste")
     except Exception as e:
-        logger.error(f"Errore nella scansione dei file esistenti: {str(e)}")
+        print(f"\n[ERRORE] Errore nella scansione dei file esistenti: {str(e)}")
     return existing_files
 
 async def verify_file_integrity(file_path: str, expected_size: int) -> bool:
@@ -1646,29 +1661,12 @@ async def main():
         print("Scansione directory JSON...")
         logger.info("Scansione dei file esistenti...")
         
-        # Usa rich per mostrare una barra di progresso
-        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+        # Scansiona i file JSON
+        existing_json_files = scan_existing_files('downloads/json')
+        print("\nScansione directory CSV...")
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            # Task per la scansione JSON
-            json_task = progress.add_task("[cyan]Scansione file JSON...", total=None)
-            
-            # Scansiona i file JSON
-            existing_json_files = scan_existing_files('downloads/json')
-            progress.update(json_task, completed=True, description="[green]Scansione JSON completata")
-            
-            # Task per la scansione CSV
-            csv_task = progress.add_task("[cyan]Scansione file CSV...", total=None)
-            
-            # Scansiona i file CSV
-            existing_csv_files = scan_existing_files('downloads/csv')
-            progress.update(csv_task, completed=True, description="[green]Scansione CSV completata")
+        # Scansiona i file CSV
+        existing_csv_files = scan_existing_files('downloads/csv')
         
         # Mostra il riepilogo
         print("\n=== RIEPILOGO FILE TROVATI ===")
