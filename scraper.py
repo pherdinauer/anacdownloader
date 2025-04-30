@@ -488,7 +488,7 @@ class ANACScraper:
             # Creazione directory se non esiste
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
-            # Prepara il comando curl senza limitazioni di velocità
+            # Prepara il comando curl con progress bar
             cmd = [
                 "curl",
                 "--retry", "2",              # Solo 2 retry
@@ -497,7 +497,7 @@ class ANACScraper:
                 "--max-time", "1800",        # 30 minuti massimo
                 "--compressed",              # Compressione
                 "--location",                # Segui redirect
-                "--silent",                  # Modalità silenziosa
+                "--progress-bar",            # Mostra barra di progresso
                 "--show-error",              # Mostra errori
                 "-H", "User-Agent: Mozilla/5.0",
                 "-H", "Accept: */*",
@@ -506,13 +506,65 @@ class ANACScraper:
                 "--output", output_file
             ]
             
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            # Esegui curl e mostra l'output in tempo reale
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
             )
             
-            stdout, stderr = await process.communicate()
+            # Monitora il progresso
+            start_time = time.time()
+            last_update = start_time
+            last_percentage = 0
+            
+            while True:
+                # Leggi l'output di curl
+                line = process.stderr.readline()
+                if not line and process.poll() is not None:
+                    break
+                    
+                if line:
+                    line = line.strip()
+                    
+                    # Estrai informazioni dalla barra di progresso di curl
+                    if '%' in line:
+                        try:
+                            # Estrai percentuale e velocità
+                            parts = line.split()
+                            current_percentage = 0
+                            current_speed = 0
+                            
+                            for part in parts:
+                                if '%' in part:
+                                    current_percentage = float(part.replace('%', ''))
+                                if 'MiB/s' in part:
+                                    current_speed = float(part.replace('MiB/s', ''))
+                                elif 'KiB/s' in part:
+                                    current_speed = float(part.replace('KiB/s', '')) / 1024
+                                elif 'B/s' in part:
+                                    current_speed = float(part.replace('B/s', '')) / (1024 * 1024)
+                            
+                            # Aggiorna solo se la percentuale è cambiata significativamente
+                            if abs(current_percentage - last_percentage) >= 1 or time.time() - last_update >= 1:
+                                # Calcola ETA
+                                elapsed = time.time() - start_time
+                                if current_percentage > 0 and elapsed > 0:
+                                    remaining = (100 - current_percentage) * elapsed / current_percentage
+                                    eta = f"{int(remaining/60)}m {int(remaining%60)}s"
+                                    
+                                    # Stampa il progresso
+                                    print(f"\rProgresso: {current_percentage:.1f}% - Velocità: {current_speed:.1f} MB/s - ETA: {eta}", end='', flush=True)
+                                    
+                                    last_percentage = current_percentage
+                                    last_update = time.time()
+                        except:
+                            pass
+            
+            print()  # Nuova linea dopo il completamento
+            
+            stdout, stderr = process.communicate()
             
             if process.returncode == 0 and os.path.exists(output_file):
                 actual_size = os.path.getsize(output_file)
@@ -522,7 +574,7 @@ class ANACScraper:
                 else:
                     self.logger.logger.warning(f"Dimensione file non corrispondente. Prevista: {file_size}, Attuale: {actual_size}")
             else:
-                error_msg = stderr.decode() if stderr else "Errore sconosciuto"
+                error_msg = stderr if stderr else "Errore sconosciuto"
                 self.logger.logger.warning(f"Download veloce fallito: {error_msg}")
             
             return False
@@ -766,16 +818,20 @@ class ANACScraper:
             
             # Dimensione iniziale del segmento basata sulla dimensione totale del file
             if file_size < 100 * 1024 * 1024:  # < 100MB
-                initial_segment_size = 5 * 1024 * 1024  # 5MB
-            elif file_size < 1024 * 1024 * 1024:  # < 1GB
                 initial_segment_size = 10 * 1024 * 1024  # 10MB
+            elif file_size < 1024 * 1024 * 1024:  # < 1GB
+                initial_segment_size = 25 * 1024 * 1024  # 25MB
             else:  # >= 1GB
-                initial_segment_size = 20 * 1024 * 1024  # 20MB
+                initial_segment_size = 50 * 1024 * 1024  # 50MB
                 
             # Dimensione minima e massima del segmento
             min_segment_size = 1 * 1024 * 1024  # 1MB
-            max_segment_size = 50 * 1024 * 1024  # 50MB
+            max_segment_size = 100 * 1024 * 1024  # 100MB
             current_segment_size = min(initial_segment_size, max_segment_size)
+            
+            # Contatore per errori consecutivi
+            consecutive_errors = 0
+            max_consecutive_errors = 3  # Numero massimo di errori consecutivi prima di ridurre la dimensione
             
             # Nome file temporaneo per il download parziale
             temp_file = output_file + ".part"
@@ -830,16 +886,18 @@ class ANACScraper:
                             async with self.session.get(url, headers=headers, timeout=self.timeout, cookies=self.cookies) as response:
                                 if response.status not in (200, 206):  # 206 = Partial Content
                                     self.logger.error(f"Risposta non valida ({response.status}) per il segmento {segment_idx+1}")
+                                    consecutive_errors += 1
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
-                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
-                                    if current_segment_size > min_segment_size:
+                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento solo se abbiamo avuto molti errori consecutivi
+                                    if consecutive_errors >= max_consecutive_errors and current_segment_size > min_segment_size:
                                         current_segment_size = max(current_segment_size // 2, min_segment_size)
-                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB dopo {consecutive_errors} errori consecutivi")
                                         # Ricalcola i segmenti rimanenti
                                         total_segments = math.ceil((file_size - segment_start) / current_segment_size)
                                         segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                        consecutive_errors = 0  # Reset errori consecutivi
                                         break
                                     return False
                                 
@@ -849,16 +907,18 @@ class ANACScraper:
                                 
                                 if len(data) != expected_size:
                                     self.logger.warning(f"Dimensioni segmento non corrispondono: previsto {expected_size}, ricevuto {len(data)}")
+                                    consecutive_errors += 1
                                     if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                         await asyncio.sleep(5 * (attempt + 1))
                                         continue
-                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
-                                    if current_segment_size > min_segment_size:
+                                    # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento solo se abbiamo avuto molti errori consecutivi
+                                    if consecutive_errors >= max_consecutive_errors and current_segment_size > min_segment_size:
                                         current_segment_size = max(current_segment_size // 2, min_segment_size)
-                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                        self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB dopo {consecutive_errors} errori consecutivi")
                                         # Ricalcola i segmenti rimanenti
                                         total_segments = math.ceil((file_size - segment_start) / current_segment_size)
                                         segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                        consecutive_errors = 0  # Reset errori consecutivi
                                         break
                                 
                                 # Scrivi i dati nel file e va avanti
@@ -883,35 +943,42 @@ class ANACScraper:
                                         # Ricalcola i segmenti rimanenti
                                         total_segments = math.ceil((file_size - current_size) / current_segment_size)
                                 
+                                # Reset errori consecutivi dopo un successo
+                                consecutive_errors = 0
+                                
                                 # Successo per questo segmento, interrompi il ciclo di tentativi
                                 break
                                 
                         except asyncio.TimeoutError:
                             self.logger.warning(f"Timeout durante il download del segmento {segment_idx+1}")
+                            consecutive_errors += 1
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
-                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
-                            if current_segment_size > min_segment_size:
+                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento solo se abbiamo avuto molti errori consecutivi
+                            if consecutive_errors >= max_consecutive_errors and current_segment_size > min_segment_size:
                                 current_segment_size = max(current_segment_size // 2, min_segment_size)
-                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB dopo {consecutive_errors} errori consecutivi")
                                 # Ricalcola i segmenti rimanenti
                                 total_segments = math.ceil((file_size - segment_start) / current_segment_size)
                                 segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                consecutive_errors = 0  # Reset errori consecutivi
                                 break
                             return False
                         except Exception as e:
                             self.logger.error(f"Errore durante il download del segmento {segment_idx+1}: {str(e)}")
+                            consecutive_errors += 1
                             if attempt < 4:  # Riprova se non è l'ultimo tentativo
                                 await asyncio.sleep(5 * (attempt + 1))
                                 continue
-                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento
-                            if current_segment_size > min_segment_size:
+                            # Se fallisce dopo tutti i tentativi, riduci la dimensione del segmento solo se abbiamo avuto molti errori consecutivi
+                            if consecutive_errors >= max_consecutive_errors and current_segment_size > min_segment_size:
                                 current_segment_size = max(current_segment_size // 2, min_segment_size)
-                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB")
+                                self.logger.warning(f"Riduco dimensione segmento a {current_segment_size/(1024*1024):.1f}MB dopo {consecutive_errors} errori consecutivi")
                                 # Ricalcola i segmenti rimanenti
                                 total_segments = math.ceil((file_size - segment_start) / current_segment_size)
                                 segment_idx -= 1  # Riprova lo stesso segmento con dimensione ridotta
+                                consecutive_errors = 0  # Reset errori consecutivi
                                 break
                             return False
             
@@ -1055,75 +1122,25 @@ class ANACScraper:
                     self.logger.logger.info(f"File {os.path.basename(output_file)} esiste già con dimensione corretta. Download saltato.")
                     return True
                 else:
-                    self.logger.logger.info(f"File {os.path.basename(output_file)} esiste ma dimensione diversa (attuale: {current_size}, attesa: {file_size}). Ridownload.")
+                    self.logger.logger.info(f"File {os.path.basename(output_file)} esiste ma dimensione diversa (attuale: {current_size}, attesa: {file_size}). Tentativo download veloce.")
             
             # Assicurati che la directory esista
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
-            # Preparazione per il download
-            if self.session is None:
-                self.session = aiohttp.ClientSession(headers=self.headers, timeout=self.timeout)
+            # Prima prova con download veloce (curl/wget)
+            if self.USE_EXTERNAL:
+                self.logger.logger.info(f"Tentativo download veloce per {os.path.basename(output_file)}")
+                if await self._fast_download(url, output_file, file_size):
+                    return True
+                self.logger.logger.warning(f"Download veloce fallito, tentativo con browser...")
             
-            # Registra l'inizio del download
-            start_time = time.time()
-            filename = os.path.basename(output_file)
-            self.logger.log_download_start(filename, file_size, url)
+            # Se il download veloce fallisce, prova con il browser
+            if await self._browser_download(url, output_file, file_size):
+                return True
+            self.logger.logger.warning(f"Download browser fallito, tentativo con segmenti...")
             
-            # Controlla se possiamo riprendere il download
-            mode = 'ab'
-            start_byte = 0
-            if os.path.exists(output_file):
-                start_byte = os.path.getsize(output_file)
-                self.logger.logger.info(f"Riprendo download da {start_byte/(1024*1024):.1f}MB")
-            else:
-                mode = 'wb'
-            
-            # Prepara gli header
-            headers = self.headers.copy()
-            if start_byte > 0:
-                headers['Range'] = f'bytes={start_byte}-'
-            
-            # Effettua la richiesta
-            async with self.session.get(url, headers=headers, timeout=self.timeout) as response:
-                if response.status not in (200, 206):
-                    self.logger.logger.error(f"Errore HTTP: {response.status}")
-                    return False
-                
-                # Avvia il monitoraggio del progresso
-                monitor_task = asyncio.create_task(
-                    self._monitor_download_progress_with_eta(output_file, file_size)
-                )
-                
-                # Scarica a blocchi
-                with open(output_file, mode) as f:
-                    downloaded_size = start_byte
-                    async for chunk in response.content.iter_chunked(self.chunk_size):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                
-                # Cancella il task di monitoraggio
-                monitor_task.cancel()
-                try:
-                    await monitor_task
-                except asyncio.CancelledError:
-                    pass
-                
-                # Verifica dimensione finale
-                if os.path.exists(output_file):
-                    actual_size = os.path.getsize(output_file)
-                    if abs(actual_size - file_size) <= 1024:  # Tollera differenza dell'1%
-                        elapsed = time.time() - start_time
-                        self.logger.log_download_complete(filename, elapsed)
-                        return True
-                    else:
-                        self.logger.log_download_error(
-                            filename, 
-                            f"Dimensione non corrispondente: attesa {file_size}, reale {actual_size}",
-                            url
-                        )
-                
-                return False
+            # Se entrambi i metodi falliscono, usa il download a segmenti
+            return await self.download_file_in_segments(url, output_file, file_size)
                 
         except Exception as e:
             self.logger.logger.error(f"Errore nel download con aiohttp: {str(e)}")
@@ -1685,7 +1702,7 @@ async def main():
                         
                         # Tenta il download
                         try:
-                            if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
                                 successful_downloads += 1
                                 logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
                             else:
@@ -1725,7 +1742,7 @@ async def main():
                         
                         # Tenta il download
                         try:
-                            if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
                                 successful_downloads += 1
                                 logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
                             else:
@@ -1800,7 +1817,7 @@ async def main():
                             
                             # Tenta il download
                             try:
-                                if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                if await scraper.download_file(file_info['url'], output_file, file_info['size']):
                                     successful_downloads += 1
                                     logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
                                 else:
@@ -1840,7 +1857,7 @@ async def main():
                             
                             # Tenta il download
                             try:
-                                if await scraper.download_file_in_segments(file_info['url'], output_file, file_info['size']):
+                                if await scraper.download_file(file_info['url'], output_file, file_info['size']):
                                     successful_downloads += 1
                                     logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
                                 else:
