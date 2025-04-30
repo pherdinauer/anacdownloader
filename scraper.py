@@ -518,6 +518,7 @@ class ANACScraper:
             start_time = time.time()
             last_update = start_time
             last_percentage = 0
+            last_bytes = 0
             
             while True:
                 # Leggi l'output di curl
@@ -531,20 +532,24 @@ class ANACScraper:
                     # Estrai informazioni dalla barra di progresso di curl
                     if '%' in line:
                         try:
-                            # Estrai percentuale e velocità
+                            # Estrai percentuale
                             parts = line.split()
                             current_percentage = 0
-                            current_speed = 0
                             
                             for part in parts:
                                 if '%' in part:
                                     current_percentage = float(part.replace('%', ''))
-                                if 'MiB/s' in part:
-                                    current_speed = float(part.replace('MiB/s', ''))
-                                elif 'KiB/s' in part:
-                                    current_speed = float(part.replace('KiB/s', '')) / 1024
-                                elif 'B/s' in part:
-                                    current_speed = float(part.replace('B/s', '')) / (1024 * 1024)
+                            
+                            # Calcola i byte scaricati basandosi sulla percentuale
+                            current_bytes = (current_percentage / 100) * file_size
+                            
+                            # Calcola la velocità solo se abbiamo abbastanza dati
+                            if current_bytes > last_bytes and time.time() - last_update > 0:
+                                speed = (current_bytes - last_bytes) / (time.time() - last_update) / (1024 * 1024)  # MB/s
+                                last_bytes = current_bytes
+                                last_update = time.time()
+                            else:
+                                speed = 0
                             
                             # Aggiorna solo se la percentuale è cambiata significativamente
                             if abs(current_percentage - last_percentage) >= 1 or time.time() - last_update >= 1:
@@ -555,10 +560,9 @@ class ANACScraper:
                                     eta = f"{int(remaining/60)}m {int(remaining%60)}s"
                                     
                                     # Stampa il progresso
-                                    print(f"\rProgresso: {current_percentage:.1f}% - Velocità: {current_speed:.1f} MB/s - ETA: {eta}", end='', flush=True)
+                                    print(f"\rProgresso: {current_percentage:.1f}% - Velocità: {speed:.1f} MB/s - ETA: {eta}", end='', flush=True)
                                     
                                     last_percentage = current_percentage
-                                    last_update = time.time()
                         except:
                             pass
             
