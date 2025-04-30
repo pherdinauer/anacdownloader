@@ -1505,386 +1505,419 @@ class ANACScraper:
         self.logger.logger.info(f"Recupero completato. Trovati {len(dataset_pages)} dataset totali.")
         return dataset_pages
 
+def save_crash_report(error, traceback_info, cache_data=None):
+    """Salva un report dettagliato quando il programma crasha."""
+    try:
+        # Crea la directory crash_reports se non esiste
+        os.makedirs("crash_reports", exist_ok=True)
+        
+        # Nome del file con timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        crash_file = f"crash_reports/crash_report_{timestamp}.txt"
+        
+        with open(crash_file, 'w', encoding='utf-8') as f:
+            f.write("=== CRASH REPORT ===\n\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Error: {str(error)}\n\n")
+            
+            f.write("=== TRACEBACK ===\n")
+            f.write(traceback_info)
+            f.write("\n\n")
+            
+            f.write("=== SYSTEM INFO ===\n")
+            f.write(f"OS: {platform.system()} {platform.release()}\n")
+            f.write(f"Python Version: {sys.version}\n")
+            f.write(f"Current Directory: {os.getcwd()}\n")
+            f.write(f"Script Path: {os.path.abspath(__file__)}\n\n")
+            
+            if cache_data:
+                f.write("=== CACHE INFO ===\n")
+                f.write(f"Cache File Exists: {os.path.exists('datasets_cache.json')}\n")
+                if os.path.exists('datasets_cache.json'):
+                    cache_size = os.path.getsize('datasets_cache.json')
+                    f.write(f"Cache File Size: {cache_size} bytes\n")
+                f.write(f"Number of Datasets in Cache: {len(cache_data.get('datasets', {}))}\n")
+                f.write("\nCache Structure:\n")
+                for dataset_url, dataset_info in cache_data.get('datasets', {}).items():
+                    f.write(f"\nDataset: {dataset_url}\n")
+                    if 'json_files' in dataset_info:
+                        f.write(f"  JSON Files: {len(dataset_info['json_files'])}\n")
+                    if 'csv_files' in dataset_info:
+                        f.write(f"  CSV Files: {len(dataset_info['csv_files'])}\n")
+            
+            f.write("\n=== ENVIRONMENT VARIABLES ===\n")
+            for key, value in os.environ.items():
+                if any(sensitive in key.lower() for sensitive in ['key', 'pass', 'secret', 'token']):
+                    f.write(f"{key}: [REDACTED]\n")
+                else:
+                    f.write(f"{key}: {value}\n")
+        
+        print(f"\nIl programma è crashato. Un report dettagliato è stato salvato in: {crash_file}")
+        print("Per favore, condividi questo file per aiutare a diagnosticare il problema.")
+        
+    except Exception as e:
+        print(f"\nErrore durante il salvataggio del crash report: {str(e)}")
+        print("Traceback originale:")
+        print(traceback_info)
+
 async def main():
     """Funzione principale per il download dei dataset."""
-    # Crea le directory necessarie
-    os.makedirs('downloads/json', exist_ok=True)
-    os.makedirs('downloads/csv', exist_ok=True)
-    
-    # Inizializza il logger
-    logger = AdvancedLogger()
-    
-    # Carica o crea il file di cache
-    cache_file = 'datasets_cache.json'
-    cache_data = {}
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            logger.logger.info("Cache caricata con successo")
-        except Exception as e:
-            logger.logger.error(f"Errore nel caricamento della cache: {str(e)}")
-            cache_data = {}
-    
-    # Verifica se la cache è valida
-    is_cache_valid = False
-    if cache_data and 'datasets' in cache_data:
-        is_cache_valid = True
-        logger.logger.info(f"Cache valida con {len(cache_data['datasets'])} dataset")
-    
-    # Se la cache non è valida, recupera la lista dei dataset
-    if not is_cache_valid:
-        logger.logger.info("Cache non valida o non presente, recupero lista dataset...")
-        dataset_pages = await get_dataset_pages()
-        if not dataset_pages:
-            logger.logger.error("Impossibile recuperare la lista dei dataset")
-            return
-        logger.logger.info(f"Trovati {len(dataset_pages)} dataset")
-    else:
-        # La cache usa un dizionario dove le chiavi sono gli URL dei dataset
-        dataset_pages = list(cache_data['datasets'].keys())
-        logger.logger.info(f"Utilizzo {len(dataset_pages)} dataset dalla cache")
-    
-    # Chiedi all'utente cosa vuole fare
-    print("\nCosa vuoi fare?")
-    print("1. Esegui una scansione approfondita di tutti i dataset")
-    print("2. Usa la cache esistente per il download")
-    print("3. Esci")
-    
-    choice = input("\nScelta: ").strip()
-    
-    if choice == "3":
-        print("\nOperazione annullata.")
-        return
-    
-    if choice == "1":
-        # Mostra progresso
-        print("\nAnalisi dettagli dei dataset...")
+    cache_data = None
+    try:
+        # Crea le directory necessarie
+        os.makedirs('downloads/json', exist_ok=True)
+        os.makedirs('downloads/csv', exist_ok=True)
         
-        # Analizziamo tutti i dataset, non solo un campione
-        total_json_files = 0
-        total_csv_files = 0
-        processed_datasets = 0
-        skipped_datasets = 0
-        errored_datasets = 0
+        # Inizializza il logger
+        logger = AdvancedLogger()
         
-        # Usa rich per mostrare una tabella di progresso
-        from rich.live import Live
-        from rich.table import Table
+        # Carica o crea il file di cache
+        cache_file = 'datasets_cache.json'
+        cache_data = {}
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                logger.logger.info("Cache caricata con successo")
+            except Exception as e:
+                logger.logger.error(f"Errore nel caricamento della cache: {str(e)}")
+                cache_data = {}
         
-        def generate_stats_table():
-            table = Table(title="Stato Scansione Dataset")
-            table.add_column("Metriche", justify="left", style="cyan")
-            table.add_column("Valore", justify="right", style="green")
-            table.add_row("Dataset Processati", str(processed_datasets))
-            table.add_row("Dataset Saltati", str(skipped_datasets))
-            table.add_row("Dataset con Errori", str(errored_datasets))
-            table.add_row("File JSON Trovati", str(total_json_files))
-            table.add_row("File CSV Trovati", str(total_csv_files))
-            return table
+        # Verifica se la cache è valida
+        is_cache_valid = False
+        if cache_data and 'datasets' in cache_data:
+            is_cache_valid = True
+            logger.logger.info(f"Cache valida con {len(cache_data['datasets'])} dataset")
         
-        # Processa tutti i dataset con visualizzazione in tempo reale
-        with Live(generate_stats_table(), refresh_per_second=4) as live:
-            for i, dataset_url in enumerate(dataset_pages):
-                current_dataset_info = {
-                    'url': dataset_url,
-                    'json_files': [],
-                    'csv_files': [],
-                    'analyzed': False
-                }
-                
-                # Verifica se il dataset è già nella cache
-                dataset_in_cache = False
-                if cache_data and 'datasets' in cache_data:
-                    for cached_dataset in cache_data['datasets']:
-                        if cached_dataset['url'] == dataset_url:
-                            dataset_in_cache = True
-                            current_dataset_info = cached_dataset
-                            break
-                
-                if not dataset_in_cache:
-                    try:
-                        # Recupera i file JSON
-                        json_files = await get_json_files(dataset_url)
-                        if json_files:
-                            current_dataset_info['json_files'] = json_files
-                            total_json_files += len(json_files)
-                        
-                        # Recupera i file CSV
-                        csv_files = await get_csv_files(dataset_url)
-                        if csv_files:
-                            current_dataset_info['csv_files'] = csv_files
-                            total_csv_files += len(csv_files)
-                        
-                        current_dataset_info['analyzed'] = True
-                        processed_datasets += 1
-                        
-                    except Exception as e:
-                        logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
-                        errored_datasets += 1
-                        continue
-                else:
-                    skipped_datasets += 1
-                
-                # Aggiorna la cache
-                if cache_data and 'datasets' in cache_data:
-                    # Aggiorna o aggiungi il dataset alla cache
-                    updated = False
-                    for i, cached_dataset in enumerate(cache_data['datasets']):
-                        if cached_dataset['url'] == dataset_url:
-                            cache_data['datasets'][i] = current_dataset_info
-                            updated = True
-                            break
-                    if not updated:
-                        cache_data['datasets'].append(current_dataset_info)
-                else:
-                    cache_data = {'datasets': [current_dataset_info]}
-                
-                # Salva la cache periodicamente
-                if (i + 1) % 10 == 0:
-                    try:
-                        with open(cache_file, 'w', encoding='utf-8') as f:
-                            json.dump(cache_data, f, indent=2)
-                        logger.logger.info("Cache salvata")
-                    except Exception as e:
-                        logger.logger.error(f"Errore nel salvataggio della cache: {str(e)}")
-                
-                # Aggiorna la tabella di progresso
-                live.update(generate_stats_table())
+        # Se la cache non è valida, recupera la lista dei dataset
+        if not is_cache_valid:
+            logger.logger.info("Cache non valida o non presente, recupero lista dataset...")
+            dataset_pages = await get_dataset_pages()
+            if not dataset_pages:
+                logger.logger.error("Impossibile recuperare la lista dei dataset")
+                return
+            logger.logger.info(f"Trovati {len(dataset_pages)} dataset")
+        else:
+            # La cache usa un dizionario dove le chiavi sono gli URL dei dataset
+            dataset_pages = list(cache_data['datasets'].keys())
+            logger.logger.info(f"Utilizzo {len(dataset_pages)} dataset dalla cache")
         
-        # Salva la cache finale
-        try:
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=2)
-            logger.logger.info("Cache finale salvata")
-        except Exception as e:
-            logger.logger.error(f"Errore nel salvataggio della cache finale: {str(e)}")
+        # Chiedi all'utente cosa vuole fare
+        print("\nCosa vuoi fare?")
+        print("1. Esegui una scansione approfondita di tutti i dataset")
+        print("2. Usa la cache esistente per il download")
+        print("3. Esci")
         
-        # Mostra il menu di download
-        print("\nCosa vuoi scaricare?")
-        print("1. File JSON")
-        print("2. File CSV")
-        print("3. Entrambi")
-        print("4. Esci")
+        choice = input("\nScelta: ").strip()
         
-        download_choice = input("\nScelta: ").strip()
-        
-        if download_choice == "4":
+        if choice == "3":
             print("\nOperazione annullata.")
             return
         
-        # Inizializza i contatori
-        successful_downloads = 0
-        failed_downloads = 0
-        
-        # Processa i dataset per il download
-        for dataset_info in cache_data['datasets']:
-            if not dataset_info['analyzed']:
-                continue
+        if choice == "1":
+            # Mostra progresso
+            print("\nAnalisi dettagli dei dataset...")
             
-            # Scarica i file JSON se richiesto
-            if download_choice in ["1", "3"] and dataset_info['json_files']:
-                for file_info in dataset_info['json_files']:
-                    try:
-                        output_dir = os.path.join('downloads', 'json')
-                        os.makedirs(output_dir, exist_ok=True)
-                        output_file = os.path.join(output_dir, file_info['filename'])
-                        
-                        # Verifica se il file esiste già e ha la dimensione corretta
-                        if os.path.exists(output_file):
-                            current_size = os.path.getsize(output_file)
-                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
-                                successful_downloads += 1
-                                continue
-                            else:
-                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
-                        
-                        # Tenta il download
+            # Analizziamo tutti i dataset, non solo un campione
+            total_json_files = 0
+            total_csv_files = 0
+            processed_datasets = 0
+            skipped_datasets = 0
+            errored_datasets = 0
+            
+            # Usa rich per mostrare una tabella di progresso
+            from rich.live import Live
+            from rich.table import Table
+            
+            def generate_stats_table():
+                table = Table(title="Stato Scansione Dataset")
+                table.add_column("Metriche", justify="left", style="cyan")
+                table.add_column("Valore", justify="right", style="green")
+                table.add_row("Dataset Processati", str(processed_datasets))
+                table.add_row("Dataset Saltati", str(skipped_datasets))
+                table.add_row("Dataset con Errori", str(errored_datasets))
+                table.add_row("File JSON Trovati", str(total_json_files))
+                table.add_row("File CSV Trovati", str(total_csv_files))
+                return table
+            
+            # Processa tutti i dataset con visualizzazione in tempo reale
+            with Live(generate_stats_table(), refresh_per_second=4) as live:
+                for i, dataset_url in enumerate(dataset_pages):
+                    current_dataset_info = {
+                        'url': dataset_url,
+                        'json_files': [],
+                        'csv_files': [],
+                        'analyzed': False
+                    }
+                    
+                    # Verifica se il dataset è già nella cache
+                    dataset_in_cache = False
+                    if cache_data and 'datasets' in cache_data:
+                        for cached_dataset in cache_data['datasets']:
+                            if cached_dataset['url'] == dataset_url:
+                                dataset_in_cache = True
+                                current_dataset_info = cached_dataset
+                                break
+                    
+                    if not dataset_in_cache:
                         try:
-                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
-                                successful_downloads += 1
-                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
-                            else:
-                                failed_downloads += 1
-                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                            # Recupera i file JSON
+                            json_files = await get_json_files(dataset_url)
+                            if json_files:
+                                current_dataset_info['json_files'] = json_files
+                                total_json_files += len(json_files)
+                                
+                                # Recupera i file CSV
+                            csv_files = await get_csv_files(dataset_url)
+                            if csv_files:
+                                current_dataset_info['csv_files'] = csv_files
+                                total_csv_files += len(csv_files)
+                                
+                                current_dataset_info['analyzed'] = True
+                                processed_datasets += 1
+                                
                         except Exception as e:
-                            failed_downloads += 1
-                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
-                            # Se il download fallisce, rimuovi il file incompleto
-                            if os.path.exists(output_file):
-                                try:
-                                    os.remove(output_file)
-                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
-                                except:
-                                    pass
-                    except Exception as e:
-                        failed_downloads += 1
-                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
-            
-            # Scarica i file CSV se richiesto
-            if download_choice in ["2", "3"] and dataset_info['csv_files']:
-                for file_info in dataset_info['csv_files']:
-                    try:
-                        output_dir = os.path.join('downloads', 'csv')
-                        os.makedirs(output_dir, exist_ok=True)
-                        output_file = os.path.join(output_dir, file_info['filename'])
-                        
-                        # Verifica se il file esiste già e ha la dimensione corretta
-                        if os.path.exists(output_file):
-                            current_size = os.path.getsize(output_file)
-                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
-                                successful_downloads += 1
-                                continue
-                            else:
-                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
-                        
-                        # Tenta il download
+                            logger.logger.error(f"Errore nell'analisi del dataset {dataset_url}: {str(e)}")
+                            errored_datasets += 1
+                            continue
+                    else:
+                        skipped_datasets += 1
+                    
+                    # Aggiorna la cache
+                    if cache_data and 'datasets' in cache_data:
+                        # Aggiorna o aggiungi il dataset alla cache
+                        updated = False
+                        for i, cached_dataset in enumerate(cache_data['datasets']):
+                            if cached_dataset['url'] == dataset_url:
+                                cache_data['datasets'][i] = current_dataset_info
+                                updated = True
+                                break
+                        if not updated:
+                            cache_data['datasets'].append(current_dataset_info)
+                    else:
+                        cache_data = {'datasets': [current_dataset_info]}
+                    
+                    # Salva la cache periodicamente
+                    if (i + 1) % 10 == 0:
                         try:
-                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
-                                successful_downloads += 1
-                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
-                            else:
-                                failed_downloads += 1
-                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
+                            with open(cache_file, 'w', encoding='utf-8') as f:
+                                json.dump(cache_data, f, indent=2)
+                            logger.logger.info("Cache salvata")
                         except Exception as e:
-                            failed_downloads += 1
-                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
-                            # Se il download fallisce, rimuovi il file incompleto
-                            if os.path.exists(output_file):
-                                try:
-                                    os.remove(output_file)
-                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
-                                except:
-                                    pass
-                    except Exception as e:
-                        failed_downloads += 1
-                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
-        
-        # Mostra il riepilogo finale
-        print("\nRiepilogo Download:")
-        print(f"Download completati con successo: {successful_downloads}")
-        print(f"Download falliti: {failed_downloads}")
-    
-    elif choice == "2":
-        # Usa la cache esistente
-        if not cache_data or 'datasets' not in cache_data:
-            print("\nNessuna cache disponibile. Eseguire prima una scansione approfondita.")
-            return
+                            logger.logger.error(f"Errore nel salvataggio della cache: {str(e)}")
+                    
+                    # Aggiorna la tabella di progresso
+                    live.update(generate_stats_table())
             
-        print("\nUtilizzo della cache esistente per il download...")
-        print(f"Dataset nella cache: {len(cache_data['datasets'])}")
-        
-        # Mostra il menu di download
-        print("\nCosa vuoi scaricare?")
-        print("1. File JSON")
-        print("2. File CSV")
-        print("3. Entrambi")
-        print("4. Esci")
-        
-        download_choice = input("\nScelta: ").strip()
-        
-        if download_choice == "4":
-            print("\nOperazione annullata.")
-            return
-        
-        # Inizializza i contatori
-        successful_downloads = 0
-        failed_downloads = 0
-        
-        # Inizializza lo scraper
-        async with ANACScraper() as scraper:
-            # Processa i dataset dalla cache
+            # Salva la cache finale
+            try:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(cache_data, f, indent=2)
+                logger.logger.info("Cache finale salvata")
+            except Exception as e:
+                logger.logger.error(f"Errore nel salvataggio della cache finale: {str(e)}")
+            
+            # Mostra il menu di download
+            print("\nCosa vuoi scaricare?")
+            print("1. File JSON")
+            print("2. File CSV")
+            print("3. Entrambi")
+            print("4. Esci")
+            
+            download_choice = input("\nScelta: ").strip()
+            
+            if download_choice == "4":
+                print("\nOperazione annullata.")
+                return
+            
+            # Inizializza i contatori
+            successful_downloads = 0
+            failed_downloads = 0
+            
+            # Conta il numero totale di file da scaricare dalla cache
+            total_files = 0
+            files_to_download = []
+            
+            # Debug: stampa la struttura della cache
+            print("\nStruttura della cache:")
             for dataset_url, dataset_info in cache_data['datasets'].items():
-                # Scarica i file JSON se richiesto
-                if download_choice in ["1", "3"] and 'json_files' in dataset_info:
-                    for file_info in dataset_info['json_files']:
+                print(f"\nDataset: {dataset_url}")
+                if 'json_files' in dataset_info:
+                    print(f"File JSON: {len(dataset_info['json_files'])}")
+                    if download_choice in ["1", "3"]:
+                        for file_info in dataset_info['json_files']:
+                            total_files += 1
+                            files_to_download.append(('json', file_info))
+                if 'csv_files' in dataset_info:
+                    print(f"File CSV: {len(dataset_info['csv_files'])}")
+                    if download_choice in ["2", "3"]:
+                        for file_info in dataset_info['csv_files']:
+                            total_files += 1
+                            files_to_download.append(('csv', file_info))
+            
+            print(f"\nTrovati {total_files} file da scaricare")
+            
+            if total_files == 0:
+                print("\nNessun file trovato nella cache. Eseguire prima una scansione approfondita.")
+                return
+            
+            # Inizializza lo scraper
+            async with ANACScraper() as scraper:
+                # Processa i file da scaricare
+                for i, (file_type, file_info) in enumerate(files_to_download, 1):
+                    print(f"\nFile {i} di {total_files}: {file_info['filename']} ({file_type.upper()})")
+                    
+                    try:
+                        output_dir = os.path.join('downloads', file_type)
+                        os.makedirs(output_dir, exist_ok=True)
+                        output_file = os.path.join(output_dir, file_info['filename'])
+                        
+                        # Verifica se il file esiste già e ha la dimensione corretta
+                        if os.path.exists(output_file):
+                            current_size = os.path.getsize(output_file)
+                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                successful_downloads += 1
+                                continue
+                            else:
+                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                        
+                        # Tenta il download
                         try:
-                            output_dir = os.path.join('downloads', 'json')
-                            os.makedirs(output_dir, exist_ok=True)
-                            output_file = os.path.join(output_dir, file_info['filename'])
-                            
-                            # Verifica se il file esiste già e ha la dimensione corretta
-                            if os.path.exists(output_file):
-                                current_size = os.path.getsize(output_file)
-                                if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                    logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
-                                    successful_downloads += 1
-                                    continue
-                                else:
-                                    logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
-                            
-                            # Tenta il download
-                            try:
-                                if await scraper.download_file(file_info['url'], output_file, file_info['size']):
-                                    successful_downloads += 1
-                                    logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
-                                else:
-                                    failed_downloads += 1
-                                    logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
-                            except Exception as e:
+                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
+                                successful_downloads += 1
+                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
+                            else:
                                 failed_downloads += 1
-                                logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
-                                # Se il download fallisce, rimuovi il file incompleto
-                                if os.path.exists(output_file):
-                                    try:
-                                        os.remove(output_file)
-                                        logger.logger.info(f"Rimosso file incompleto: {output_file}")
-                                    except:
-                                        pass
+                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
                         except Exception as e:
                             failed_downloads += 1
-                            logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
-                
-                # Scarica i file CSV se richiesto
-                if download_choice in ["2", "3"] and 'csv_files' in dataset_info:
-                    for file_info in dataset_info['csv_files']:
-                        try:
-                            output_dir = os.path.join('downloads', 'csv')
-                            os.makedirs(output_dir, exist_ok=True)
-                            output_file = os.path.join(output_dir, file_info['filename'])
-                            
-                            # Verifica se il file esiste già e ha la dimensione corretta
+                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                            # Se il download fallisce, rimuovi il file incompleto
                             if os.path.exists(output_file):
-                                current_size = os.path.getsize(output_file)
-                                if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
-                                    logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
-                                    successful_downloads += 1
-                                    continue
-                                else:
-                                    logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
-                            
-                            # Tenta il download
-                            try:
-                                if await scraper.download_file(file_info['url'], output_file, file_info['size']):
-                                    successful_downloads += 1
-                                    logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
-                                else:
-                                    failed_downloads += 1
-                                    logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
-                            except Exception as e:
+                                try:
+                                    os.remove(output_file)
+                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                except:
+                                    pass
+                    except Exception as e:
+                        failed_downloads += 1
+                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+            
+            # Mostra il riepilogo finale
+            print("\nRiepilogo Download:")
+            print(f"Download completati con successo: {successful_downloads}")
+            print(f"Download falliti: {failed_downloads}")
+        
+        elif choice == "2":
+            # Usa la cache esistente
+            if not cache_data or 'datasets' not in cache_data:
+                print("\nNessuna cache disponibile. Eseguire prima una scansione approfondita.")
+                return
+            
+            print("\nUtilizzo della cache esistente per il download...")
+            print(f"Dataset nella cache: {len(cache_data['datasets'])}")
+            
+            # Mostra il menu di download
+            print("\nCosa vuoi scaricare?")
+            print("1. File JSON")
+            print("2. File CSV")
+            print("3. Entrambi")
+            print("4. Esci")
+            
+            download_choice = input("\nScelta: ").strip()
+            
+            if download_choice == "4":
+                print("\nOperazione annullata.")
+                return
+            
+            # Inizializza i contatori
+            successful_downloads = 0
+            failed_downloads = 0
+            
+            # Conta il numero totale di file da scaricare dalla cache
+            total_files = 0
+            files_to_download = []
+            
+            # Debug: stampa la struttura della cache
+            print("\nStruttura della cache:")
+            for dataset_url, dataset_info in cache_data['datasets'].items():
+                print(f"\nDataset: {dataset_url}")
+                if 'json_files' in dataset_info:
+                    print(f"File JSON: {len(dataset_info['json_files'])}")
+                    if download_choice in ["1", "3"]:
+                        for file_info in dataset_info['json_files']:
+                            total_files += 1
+                            files_to_download.append(('json', file_info))
+                if 'csv_files' in dataset_info:
+                    print(f"File CSV: {len(dataset_info['csv_files'])}")
+                    if download_choice in ["2", "3"]:
+                        for file_info in dataset_info['csv_files']:
+                            total_files += 1
+                            files_to_download.append(('csv', file_info))
+            
+            print(f"\nTrovati {total_files} file da scaricare")
+            
+            if total_files == 0:
+                print("\nNessun file trovato nella cache. Eseguire prima una scansione approfondita.")
+                return
+            
+            # Inizializza lo scraper
+            async with ANACScraper() as scraper:
+                # Processa i file da scaricare
+                for i, (file_type, file_info) in enumerate(files_to_download, 1):
+                    print(f"\nFile {i} di {total_files}: {file_info['filename']} ({file_type.upper()})")
+                    
+                    try:
+                        output_dir = os.path.join('downloads', file_type)
+                        os.makedirs(output_dir, exist_ok=True)
+                        output_file = os.path.join(output_dir, file_info['filename'])
+                        
+                        # Verifica se il file esiste già e ha la dimensione corretta
+                        if os.path.exists(output_file):
+                            current_size = os.path.getsize(output_file)
+                            if abs(current_size - file_info['size']) <= 1024:  # Tollera 1KB di differenza
+                                logger.logger.info(f"File già esistente e completo: {file_info['filename']}")
+                                successful_downloads += 1
+                                continue
+                            else:
+                                logger.logger.info(f"File esistente ma incompleto, riprovo il download: {file_info['filename']}")
+                        
+                        # Tenta il download
+                        try:
+                            if await scraper.download_file(file_info['url'], output_file, file_info['size']):
+                                successful_downloads += 1
+                                logger.logger.info(f"File scaricato con successo: {file_info['filename']}")
+                            else:
                                 failed_downloads += 1
-                                logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
-                                # Se il download fallisce, rimuovi il file incompleto
-                                if os.path.exists(output_file):
-                                    try:
-                                        os.remove(output_file)
-                                        logger.logger.info(f"Rimosso file incompleto: {output_file}")
-                                    except:
-                                        pass
+                                logger.logger.error(f"Errore nel download del file: {file_info['filename']}")
                         except Exception as e:
                             failed_downloads += 1
-                            logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+                            logger.logger.error(f"Errore nel download del file {file_info['filename']}: {str(e)}")
+                            # Se il download fallisce, rimuovi il file incompleto
+                            if os.path.exists(output_file):
+                                try:
+                                    os.remove(output_file)
+                                    logger.logger.info(f"Rimosso file incompleto: {output_file}")
+                                except:
+                                    pass
+                    except Exception as e:
+                        failed_downloads += 1
+                        logger.logger.error(f"Errore nella gestione del file {file_info['filename']}: {str(e)}")
+            
+            # Mostra il riepilogo finale
+            print("\nRiepilogo Download:")
+            print(f"Download completati con successo: {successful_downloads}")
+            print(f"Download falliti: {failed_downloads}")
         
-        # Mostra il riepilogo finale
-        print("\nRiepilogo Download:")
-        print(f"Download completati con successo: {successful_downloads}")
-        print(f"Download falliti: {failed_downloads}")
-        
-    else:
-        print("\nOperazione annullata.")
-        return
+        else:
+            print("\nOperazione annullata.")
+            return
+    
+    except Exception as e:
+        # Salva il crash report
+        save_crash_report(e, traceback.format_exc(), cache_data)
+        raise  # Rilancia l'eccezione per mostrare il traceback completo
 
 if __name__ == "__main__":
     asyncio.run(main()) 
